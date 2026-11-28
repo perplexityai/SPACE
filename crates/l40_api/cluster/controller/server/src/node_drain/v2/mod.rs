@@ -7,13 +7,30 @@
 //! every resident durable elsewhere, holding running sandboxes until a call
 //! asks it to evacuate. Each call is level-triggered: it states the drain
 //! and gets the node's state back, so the loop asks again on every tick and
-//! keeps nothing of the node's between ticks. Per v2 node, each tick:
+//! keeps nothing of the node's between ticks.
+//!
+//! The tick lists each node once and may act on it later. Every effect on
+//! the node, a cordon, its lift and each `DrainNode` call, is bound to the
+//! node as listed: just before it, one statement re-reads that the row is
+//! still a v2 drain in the listed phase, under the listed generation, on
+//! the listed Kubernetes UID and recorded instance, and a row that moved on
+//! (an undrain or another phase change, a registration that took it for
+//! another machine, or a cleared drain) is skipped for the tick, with no
+//! effect and nothing recorded; the next listing decides. A
+//! cordon or its lift patches the Node under the name only while its UID is
+//! the listed one, and names that UID in the patch, which the API server
+//! refuses once the Node under the name is another one.
+//!
+//! Per v2 node, each tick:
 //!
 //! 1. **Let-go first.** A node whose machine is gone some other way is let
 //!    go: its heartbeat is stale, EC2 lists its instance `terminated` (now,
 //!    or not at all once the drain recorded it `terminated`,
 //!    `drain_status.terminated_observed_at`, which the loop records for
-//!    every v2 row the first time EC2 says so), and its Kubernetes Node is
+//!    every v2 row the first time EC2 says so, with the instance it is
+//!    about, `drain_status.terminated_observed_instance`: a record about
+//!    another instance doesn't count, and one without an instance counts
+//!    for whichever instance the drain asks about), and its Kubernetes Node is
 //!    gone or its `providerID` names that instance. EC2 not listing an
 //!    instance it was never seen to list `terminated` isn't death. The loop
 //!    clears the v2 columns and the phase under the node's lock and records
@@ -25,14 +42,20 @@
 //!    The node unseals and hands nothing back: a sandbox the drain suspended
 //!    stays suspended until a call wakes it. Then lift the cordon, which
 //!    `:undrain` leaves on a v2 node so nothing places on a node still
-//!    sealed, and clear the engine and status, both under the row's lock and
-//!    only while the row is still this generation's cancel. An `Aborted`
-//!    call, an error or no answer is unanswered (`node_drain.v2.unanswered`),
+//!    sealed, and once it is lifted clear the engine and status, only while
+//!    the row is still this generation's cancel. No row lock spans the
+//!    lift. While one controller runs ticks, the API refuses a `:drain`
+//!    until the clear lands, so no drain of the node starts and cordons in
+//!    between; a lift from an outgoing controller's last tick can still land
+//!    after a new drain's cordon, which that drain's next tick restores.
+//!    An `Aborted` call, an error or no answer is unanswered
+//!    (`node_drain.v2.unanswered`),
 //!    goes to `drain_last_error`, and is retried next tick, forever: giving
 //!    up would uncordon a sealed node or orphan its seal.
 //! 3. **Draining**: converge the cordon; a cordon refused because the Node
-//!    under the name is another one than the drain's (its UID moved) gets no
-//!    `DrainNode` call this tick. Call `DrainNode{generation, Drain{evacuate}}`,
+//!    under the name is another one than the drain's (its UID moved, or the
+//!    API server refused the patch naming it) gets no `DrainNode` call this
+//!    tick. Call `DrainNode{generation, Drain{evacuate}}`,
 //!    `evacuate` once the database clock has reached the deadline. An
 //!    `Aborted` call is another call in progress on the node: the tick skips
 //!    the node. An answer that isn't a drain report under the generation
@@ -80,7 +103,8 @@
 //!    nothing: the node returns to `drained`, with why in
 //!    `drain_last_error`, and the operator retries.
 //!    Only the `aws` terminator fences. After the fence, the loop asks EC2
-//!    about that instance on its dispatch backoff and, while EC2 lists it in
+//!    about that instance on its dispatch backoff (one EC2 call per tick
+//!    asks about every instance the tick asks about) and, while EC2 lists it in
 //!    a state other than `shutting-down` or `terminated` and no dispatch has
 //!    succeeded, asks Auto Scaling to terminate exactly it, recording
 //!    `dispatched_at` on success; it never dispatches after that, and an
@@ -247,11 +271,13 @@ pub trait V2InstanceAuthority: Send + Sync + 'static {
     /// One that doesn't never fences a node.
     fn terminates(&self) -> bool;
 
-    /// EC2's answer for `instance_id`.
-    fn describe_instance(
+    /// EC2's answer for each of `instance_ids`, in one call: every id asked
+    /// has an answer, and an error or a timeout is
+    /// [`InstanceEvidence::Unknown`] for every one.
+    fn describe_instances(
         &self,
-        instance_id: &str,
-    ) -> impl std::future::Future<Output = InstanceEvidence> + Send;
+        instance_ids: &[String],
+    ) -> impl std::future::Future<Output = HashMap<String, InstanceEvidence>> + Send;
 
     /// Ask Auto Scaling to terminate exactly `instance_id`.
     fn terminate_instance(
@@ -259,6 +285,43 @@ pub trait V2InstanceAuthority: Send + Sync + 'static {
         instance_id: &str,
         decrement_capacity: bool,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+}
+
+/// EC2's answer for each of `asked`, from the instances one call listed: an
+/// id listed under none of them is [`InstanceEvidence::NotListed`].
+pub fn evidence_by_id(
+    asked: &[&str],
+    listed: Vec<pplx_space_aws_client::ec2::Instance>,
+) -> HashMap<String, InstanceEvidence> {
+    let mut states: HashMap<String, Vec<String>> = asked
+        .iter()
+        .map(|instance_id| ((*instance_id).to_owned(), Vec::new()))
+        .collect();
+    for instance in listed {
+        if let Some(listed) = states.get_mut(&instance.instance_id) {
+            listed.push(instance.state);
+        }
+    }
+    states
+        .into_iter()
+        .map(|(instance_id, states)| (instance_id, InstanceEvidence::from_states(&states)))
+        .collect()
+}
+
+/// [`InstanceEvidence::Unknown`] for each of `instance_ids`, with `why`.
+fn unknown_for<'a>(
+    instance_ids: impl IntoIterator<Item = &'a str>,
+    why: &str,
+) -> HashMap<String, InstanceEvidence> {
+    instance_ids
+        .into_iter()
+        .map(|instance_id| {
+            (
+                instance_id.to_owned(),
+                InstanceEvidence::Unknown(why.to_owned()),
+            )
+        })
+        .collect()
 }
 
 /// The v2 loop's authority: EC2 and Auto Scaling, with the `aws`
@@ -277,30 +340,44 @@ impl V2InstanceAuthority for V2Terminator {
         matches!(self, Self::Ec2 { .. })
     }
 
-    async fn describe_instance(&self, instance_id: &str) -> InstanceEvidence {
+    async fn describe_instances(
+        &self,
+        instance_ids: &[String],
+    ) -> HashMap<String, InstanceEvidence> {
         let Self::Ec2 { ec2, .. } = self else {
-            return InstanceEvidence::Unknown("the terminator is not aws".to_owned());
+            return unknown_for(
+                instance_ids.iter().map(String::as_str),
+                "the terminator is not aws",
+            );
         };
-        if Ec2InstanceId::parse(instance_id).is_none() {
-            return InstanceEvidence::Unknown(format!("{instance_id} is not an instance id"));
+        let (asked, malformed): (Vec<&str>, Vec<&str>) = instance_ids
+            .iter()
+            .map(String::as_str)
+            .partition(|instance_id| Ec2InstanceId::parse(instance_id).is_some());
+        let mut answers: HashMap<String, InstanceEvidence> = malformed
+            .into_iter()
+            .map(|instance_id| {
+                (
+                    instance_id.to_owned(),
+                    InstanceEvidence::Unknown(format!("{instance_id} is not an instance id")),
+                )
+            })
+            .collect();
+        if asked.is_empty() {
+            return answers;
         }
-        match tokio::time::timeout(
-            AWS_CALL_TIMEOUT,
-            ec2.describe_instances_by_ids(&[instance_id]),
-        )
-        .await
-        {
-            Ok(Ok(instances)) => {
-                let states: Vec<String> = instances
-                    .into_iter()
-                    .filter(|instance| instance.instance_id == instance_id)
-                    .map(|instance| instance.state)
-                    .collect();
-                InstanceEvidence::from_states(&states)
-            }
-            Ok(Err(error)) => InstanceEvidence::Unknown(error.to_string()),
-            Err(_) => InstanceEvidence::Unknown("the EC2 call timed out".to_owned()),
-        }
+        // The client asks with an `instance-id` filter, so an id EC2 doesn't
+        // know is left out of the answer rather than failing the call.
+        answers.extend(
+            match tokio::time::timeout(AWS_CALL_TIMEOUT, ec2.describe_instances_by_ids(&asked))
+                .await
+            {
+                Ok(Ok(instances)) => evidence_by_id(&asked, instances),
+                Ok(Err(error)) => unknown_for(asked, &error.to_string()),
+                Err(_) => unknown_for(asked, "the EC2 call timed out"),
+            },
+        );
+        answers
     }
 
     async fn terminate_instance(
@@ -480,6 +557,7 @@ impl EvacuationRecord {
 pub struct DrainCallError {
     text: String,
     aborted: bool,
+    moved: bool,
 }
 
 impl DrainCallError {
@@ -488,6 +566,7 @@ impl DrainCallError {
         Self {
             text: status.to_string(),
             aborted: status.code() == tonic::Code::Aborted,
+            moved: false,
         }
     }
 
@@ -496,7 +575,24 @@ impl DrainCallError {
         Self {
             text: text.into(),
             aborted: false,
+            moved: false,
         }
+    }
+
+    /// No call was made: the row is no longer the drain the tick listed
+    /// ([`DrainV2Sink::drain_node`]).
+    pub fn moved() -> Self {
+        Self {
+            text: "the node's row is no longer the drain the tick listed".to_owned(),
+            aborted: false,
+            moved: true,
+        }
+    }
+
+    /// The call wasn't made because the row moved on since the tick listed
+    /// it: the node is skipped this tick, with nothing recorded.
+    pub const fn is_moved(&self) -> bool {
+        self.moved
     }
 
     /// The node refused the call because another `DrainNode` call was in
@@ -516,9 +612,13 @@ impl std::fmt::Display for DrainCallError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CordonFailure {
     /// The Kubernetes Node under the drain's node name is another one than
-    /// the drain's: its UID isn't the one registration recorded. The node
-    /// isn't called this tick.
+    /// the drain's: its UID isn't the one the tick listed, or the API server
+    /// refused the patch that named that UID. The node isn't called this
+    /// tick.
     UidMismatch(String),
+    /// Nothing was patched: the row is no longer the drain the tick listed.
+    /// The node is skipped this tick, with nothing recorded.
+    Moved,
     /// Anything else.
     Other(String),
 }
@@ -527,6 +627,7 @@ impl std::fmt::Display for CordonFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UidMismatch(text) | Self::Other(text) => f.write_str(text),
+            Self::Moved => f.write_str("the node's row is no longer the drain the tick listed"),
         }
     }
 }
@@ -546,16 +647,23 @@ pub trait DrainV2Sink: Send + Sync + 'static {
     fn list_v2_nodes(
         &self,
     ) -> impl std::future::Future<Output = Result<Vec<V2Node>, String>> + Send;
-    /// Converge the node's cordon, as the v1 drain does.
+    /// Cordon `node`, the node as the tick listed it: first re-read that its
+    /// row is still that drain, in the listed phase, under the listed
+    /// generation, on the listed Kubernetes UID and recorded instance
+    /// ([`CordonFailure::Moved`] if not), then patch the Node under its name only while its UID is the
+    /// listed one ([`CordonFailure::UidMismatch`] if not). A Node that is
+    /// gone has no cordon to converge.
     fn ensure_cordon(
         &self,
-        node_id: NodeId,
+        node: &V2Node,
     ) -> impl std::future::Future<Output = Result<(), CordonFailure>> + Send;
-    /// Call the node's `DrainNode` with `request` ([`drain_request`],
-    /// [`cancel_request`]).
+    /// Call the `DrainNode` of `node`, the node as the tick listed it, with
+    /// `request` ([`drain_request`], [`cancel_request`]), once its row still
+    /// reads as listed, as [`Self::ensure_cordon`] re-reads it; else make no
+    /// call ([`DrainCallError::moved`]).
     fn drain_node(
         &self,
-        node_id: NodeId,
+        node: &V2Node,
         request: DrainNodeRequest,
     ) -> impl std::future::Future<Output = Result<DrainNodeResponse, DrainCallError>> + Send;
     fn record_evacuation(
@@ -590,16 +698,19 @@ pub trait DrainV2Sink: Send + Sync + 'static {
         generation: u64,
         refused: &str,
     ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
-    /// Lift the node's cordon and clear an undrained row's v2 columns once
-    /// its generation is cancelled on the node, both under the row's lock
-    /// and only while the row is still that generation's cancel, so a drain
-    /// of the node started meanwhile, which takes that lock, cordons after
-    /// it. False, with nothing done, when the row is no longer that
-    /// generation's cancel.
+    /// Once `node`'s listed generation is cancelled on the node, lift its
+    /// cordon, then clear the undrained row's v2 columns, with no row lock
+    /// across the Kubernetes calls: the lift only while the row still reads
+    /// as the tick listed it and the Node under the name has the listed
+    /// UID, the clear only after a lift that succeeded, and only while the
+    /// row is still that generation's cancel. While one controller runs
+    /// ticks, no drain of the node can start meanwhile: the API refuses a
+    /// `:drain` while the cancel is pending. False, with nothing cleared,
+    /// when the row is no longer that generation's cancel, or was listed
+    /// with no generation.
     fn finish_cancel(
         &self,
-        node_id: NodeId,
-        generation: u64,
+        node: &V2Node,
     ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
     /// For each v2 node, how many of the sandboxes its drain has seen
     /// running (`drain_status.observed_running`) are `suspended`, their
@@ -643,10 +754,12 @@ pub trait DrainV2Sink: Send + Sync + 'static {
         instance_id: &str,
     ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
     /// Record that EC2 listed `instance_id`, the instance the drain asks
-    /// about (its fence, else its recorded instance), `terminated`
-    /// (`drain_status.terminated_observed_at`), keeping the first time it
-    /// did; false when the row is no longer that generation's v2 drain
-    /// asking about that instance.
+    /// about (its fence, else its recorded instance), `terminated`, with the
+    /// instance (`drain_status.terminated_observed_at`,
+    /// `drain_status.terminated_observed_instance`): keeps the first time of
+    /// a record about that instance, or of one that names none, and replaces
+    /// one about another instance; false when the row is no longer that
+    /// generation's v2 drain asking about that instance.
     fn record_terminated_observed(
         &self,
         node_id: NodeId,
@@ -722,8 +835,9 @@ enum NodeStep {
 
 /// One pass over every v2 node, [`NODE_CONCURRENCY`] at a time. A node the
 /// last tick listed and this one doesn't has its v2 gauges zeroed. EC2 is
-/// asked first, about each fenced node that the backoff lets ask and each
-/// other node whose heartbeat is stale; each node's step reads its answer.
+/// asked first, in one call about every instance the tick asks about: each
+/// fenced node's that the backoff lets ask and each other node's whose
+/// heartbeat is stale; each node's step reads its answer.
 /// Then the sandboxes each listed node's drain left suspended longer than
 /// the config's bound are counted.
 pub async fn tick<S: DrainV2Sink, A: V2InstanceAuthority>(
@@ -764,17 +878,29 @@ pub async fn tick<S: DrainV2Sink, A: V2InstanceAuthority>(
         })
         .map(|node| (node.id, node.asked_instance().map(str::to_owned)))
         .collect();
-    let evidence: HashMap<NodeId, InstanceEvidence> = futures_util::stream::iter(asked)
-        .map(|(node_id, instance_id)| async move {
+    let instance_ids: Vec<String> = asked
+        .iter()
+        .filter_map(|(_, instance_id)| instance_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let answers = if instance_ids.is_empty() {
+        HashMap::new()
+    } else {
+        authority.describe_instances(&instance_ids).await
+    };
+    let evidence: HashMap<NodeId, InstanceEvidence> = asked
+        .into_iter()
+        .map(|(node_id, instance_id)| {
             let answer = match instance_id {
-                Some(instance_id) => authority.describe_instance(&instance_id).await,
+                Some(instance_id) => answers.get(&instance_id).cloned().unwrap_or_else(|| {
+                    InstanceEvidence::Unknown("EC2 gave no answer for it".to_owned())
+                }),
                 None => InstanceEvidence::Unknown("the node records no EC2 instance".to_owned()),
             };
             (node_id, answer)
         })
-        .buffer_unordered(NODE_CONCURRENCY)
-        .collect()
-        .await;
+        .collect();
     let steps: Vec<_> = futures_util::stream::iter(nodes.into_iter().map(|node| {
         let evidence = evidence.get(&node.id).cloned();
         (node, evidence)

@@ -1,7 +1,11 @@
-//! [`DrainV2Sink`] for the production sink: the v2 loop's statements over
-//! `nodes`, its evacuation record, and its node-api calls.
+//! [`DrainV2Sink`] for the production sink, [`V2Sink`]: the v2 loop's
+//! statements over `nodes`, its evacuation record, and its Kubernetes and
+//! node-api calls.
 
 use std::str::FromStr;
+
+use k8s_openapi::api::core::v1::Node;
+use kube::api::{Patch, PatchParams};
 
 use pplx_space_api::controllers::substrate::connect_internal_node_api_client_for_target;
 use pplx_space_sbx_mgr_client::proto::{DrainEvacuated, DrainNodeRequest, DrainNodeResponse};
@@ -11,7 +15,7 @@ use pplx_space_node_registration_store::drain_v2::{
     LockedV2Node, StoredV2Report, add_v2_evacuated, advance_v2_drained, evacuated_still_suspended,
     finish_v2_cancel, let_go_v2_node, list_v2_node_rows, read_locked_v2_node,
     record_terminate_held, record_v2_dispatched, record_v2_error, record_v2_report,
-    record_v2_terminated_observed, return_v2_drained, write_fence,
+    record_v2_terminated_observed, return_v2_drained, v2_node_as_listed, write_fence,
 };
 
 use super::*;
@@ -24,8 +28,158 @@ use crate::node_drain::v2::{
 /// How long one `DrainNode` call may take; the node answers without waiting.
 const DRAIN_NODE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How long the direct Kubernetes Node GET may take, and a cordon's lift.
+/// How long the direct Kubernetes Node GET may take, and each cordon or
+/// lift's patch.
 const NODE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The v2 loop's production sink ([`DrainV2Sink`]): its statements over
+/// `nodes` on `pool`, and its Kubernetes and node-api calls through
+/// `substrate`. It carries none of v1's drain configuration.
+pub struct V2Sink {
+    pool: PgPool,
+    substrate: Arc<KubernetesSubstrate>,
+}
+
+impl V2Sink {
+    pub fn new(pool: PgPool, substrate: Arc<KubernetesSubstrate>) -> Self {
+        Self { pool, substrate }
+    }
+
+    /// Whether `node`'s row still reads as the tick listed it: its v2 drain
+    /// in the listed phase, under the listed generation, on the listed
+    /// Kubernetes UID and recorded instance ([`v2_node_as_listed`]). The
+    /// loop reads it just before each effect on the node.
+    async fn still_listed(&self, node: &V2Node) -> Result<bool, String> {
+        still_listed(&self.pool, node).await
+    }
+
+    fn nodes(&self) -> kube::Api<Node> {
+        kube::Api::all(self.substrate.k8s.client.clone())
+    }
+}
+
+/// [`V2Sink::still_listed`] on `pool`. A node listed without a generation
+/// is no drain the loop acts on.
+async fn still_listed(pool: &PgPool, node: &V2Node) -> Result<bool, String> {
+    let Some(generation) = node.generation else {
+        return Ok(false);
+    };
+    v2_node_as_listed(
+        pool,
+        node.id,
+        node.phase.as_deref(),
+        generation_i64(generation)?,
+        node.k8s_node_uid.as_deref(),
+        node.instance_id.as_deref(),
+    )
+    .await
+    .map_err(|error| format!("re-reading the node's row failed: {error}"))
+}
+
+/// What a cordon or its lift does, given what a GET of the Node under the
+/// drain's node name answered.
+#[derive(Clone, Debug, PartialEq)]
+enum NodePatch {
+    /// The Node is gone: there is no cordon to set or lift.
+    Gone,
+    /// The Node under the name is another one than the drain's: its UID
+    /// isn't the listed one.
+    AnotherNode,
+    /// This merge patch, which names the Node's UID, so the API server
+    /// refuses it once the Node under the name is another one.
+    Patch(serde_json::Value),
+}
+
+/// The patch that makes the Node `node` (the GET's answer, `None` for a
+/// 404) `unschedulable` or schedulable, when its UID is `listed_uid`, the
+/// one the tick listed. A listing without a UID compares nothing; the patch
+/// then names the UID the GET read.
+fn node_patch(listed_uid: Option<&str>, node: Option<&Node>, unschedulable: bool) -> NodePatch {
+    let Some(node) = node else {
+        return NodePatch::Gone;
+    };
+    let current = node.metadata.uid.as_deref();
+    if let (Some(listed), Some(current)) = (listed_uid, current)
+        && listed != current
+    {
+        return NodePatch::AnotherNode;
+    }
+    NodePatch::Patch(match current.or(listed_uid) {
+        Some(uid) => serde_json::json!({
+            "metadata": {"uid": uid},
+            "spec": {"unschedulable": unschedulable},
+        }),
+        None => serde_json::json!({"spec": {"unschedulable": unschedulable}}),
+    })
+}
+
+/// Whether the API server refused a patch because the UID it names isn't
+/// the UID of the Node under the name. It answers such a merge patch as an
+/// invalid change of the immutable `metadata.uid`: a 422 `Invalid` with a
+/// cause on that field. Any other refusal, a conflict included, is an
+/// ordinary failure, reported and retried next tick, whose GET and UID
+/// compare then find a replaced Node.
+fn refused_for_another_uid(error: &kube::Error) -> bool {
+    let kube::Error::Api(status) = error else {
+        return false;
+    };
+    status.is_invalid()
+        && status.details.as_ref().is_some_and(|details| {
+            details
+                .causes
+                .iter()
+                .any(|cause| cause.field == "metadata.uid")
+        })
+}
+
+/// Why a cordon or its lift didn't converge.
+#[derive(Debug)]
+enum PatchFailure {
+    /// The Node under the name is another one than the drain's.
+    AnotherNode(String),
+    Other(String),
+}
+
+/// Make the Kubernetes Node `node_name` `unschedulable` or schedulable,
+/// once its UID is `listed_uid`, the one the tick listed: a GET, the UID
+/// compare, then a merge patch that names the UID, each bounded by
+/// [`NODE_LOOKUP_TIMEOUT`]. A Node that is gone, at the GET or at the
+/// patch, is left as it is.
+async fn set_v2_node_schedulability(
+    nodes: &kube::Api<Node>,
+    node_name: &str,
+    listed_uid: Option<&str>,
+    unschedulable: bool,
+) -> Result<(), PatchFailure> {
+    let another = || {
+        PatchFailure::AnotherNode(format!(
+            "the Kubernetes Node {node_name} is another one than the drained node registered"
+        ))
+    };
+    let node = match tokio::time::timeout(NODE_LOOKUP_TIMEOUT, nodes.get_opt(node_name)).await {
+        Ok(Ok(node)) => node,
+        Ok(Err(error)) => return Err(PatchFailure::Other(error.to_string())),
+        Err(_) => return Err(PatchFailure::Other("the Node lookup timed out".to_owned())),
+    };
+    let patch = match node_patch(listed_uid, node.as_ref(), unschedulable) {
+        NodePatch::Gone => return Ok(()),
+        NodePatch::AnotherNode => return Err(another()),
+        NodePatch::Patch(patch) => patch,
+    };
+    match tokio::time::timeout(
+        NODE_LOOKUP_TIMEOUT,
+        nodes.patch(node_name, &PatchParams::default(), &Patch::Merge(&patch)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        // Deleted between the GET and the PATCH: gone, as a GET finds it.
+        Ok(Err(kube::Error::Api(status))) if status.is_not_found() => Ok(()),
+        Ok(Err(error)) if refused_for_another_uid(&error) => Err(another()),
+        Ok(Err(error)) => Err(PatchFailure::Other(error.to_string())),
+        Err(_) => Err(PatchFailure::Other("the Node patch timed out".to_owned())),
+    }
+}
 
 /// How long an active execution owns a restore, which the fence's release
 /// of a suspended row reads as a restore in flight.
@@ -264,44 +418,44 @@ pub(crate) async fn delete_v2_terminated(
     }
 }
 
-/// Finish the cancel of the undrained v2 drain of `node_id` under
-/// `generation`, once the node answered the cancel: under the node's row
-/// lock, and only while the row is still that generation's cancel (a v2
-/// engine with no phase), lift the node's cordon with `uncordon` (passed
-/// the Node's name and the uid its registration recorded), then clear the
-/// v2 columns, in one transaction. A drain of the node started since the
-/// tick listed it took the row lock to write itself, so it finds no such
-/// row and nothing is lifted or cleared; one that starts now waits for this
-/// transaction and cordons after it. Returns whether the columns were
-/// cleared; an uncordon that fails clears nothing.
-pub(crate) async fn finish_v2_cancel_locked<F, Fut>(
+/// Finish the cancel of the undrained v2 drain of `node` under the
+/// generation the tick listed, once the node answered the cancel: while the
+/// row still reads as the tick listed it, lift the node's cordon with
+/// `uncordon` (passed the Node's name and the UID the tick listed), then
+/// clear the v2 columns with the cancel's guarded statement, which matches
+/// only while the row is still that generation's cancel (a v2 engine with
+/// no phase). No row lock spans the lift. While one controller runs ticks,
+/// the API refuses a `:drain` until the clear lands, so no drain of the
+/// node starts and cordons in between; a lift from an outgoing
+/// controller's last tick can still land after a new drain's cordon, which
+/// that drain's next tick restores.
+/// Returns whether the columns were cleared; a lift that fails clears
+/// nothing, since no tick lists the row once its engine is cleared.
+pub(crate) async fn finish_v2_cancel_after_lift<F, Fut>(
     pool: &PgPool,
-    node_id: NodeId,
-    generation: i64,
+    node: &V2Node,
     uncordon: F,
 ) -> Result<bool, String>
 where
     F: FnOnce(String, Option<String>) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
 {
-    let sql_error = |error: sqlx::Error| error.to_string();
-    let mut tx = pool.begin().await.map_err(sql_error)?;
-    let Some(node) = lock_v2_node(&mut tx, node_id).await.map_err(sql_error)? else {
+    // A listing with a phase isn't a cancel, and the generation the
+    // re-read compares only changes with a new drain's start.
+    let Some(generation) = node.generation else {
         return Ok(false);
     };
-    if !node.is_v2_cancel(generation) {
+    if node.phase.is_some() || !still_listed(pool, node).await? {
         return Ok(false);
     }
-    let Some(node_name) = node.k8s_node_name else {
+    let generation = generation_i64(generation)?;
+    let Some(node_name) = node.k8s_node_name.clone() else {
         return Err("the node has no Kubernetes name whose cordon to lift".to_owned());
     };
-    uncordon(node_name, node.k8s_node_uid).await?;
-    let cleared = finish_v2_cancel(&mut *tx, node_id, generation)
+    uncordon(node_name, node.k8s_node_uid.clone()).await?;
+    finish_v2_cancel(pool, node.id, generation)
         .await
-        .map_err(sqlx::Error::from)
-        .map_err(sql_error)?;
-    tx.commit().await.map_err(sql_error)?;
-    Ok(cleared)
+        .map_err(|error| sqlx::Error::from(error).to_string())
 }
 
 /// Why a stopped sandbox's disk reported evacuated isn't recorded.
@@ -374,73 +528,48 @@ fn generation_i64(generation: u64) -> Result<i64, String> {
     i64::try_from(generation).map_err(|_| format!("generation {generation} is above i64::MAX"))
 }
 
-impl SubstrateSink {
-    /// Lift the cordon of the Kubernetes Node `node_name`, as `:uncordon`
-    /// does, once its UID is still `stored_uid`, the one registration
-    /// recorded: a same-name replacement isn't the drained node's. A Node
-    /// that is gone has no cordon to lift.
-    async fn uncordon_v2_node(
-        &self,
-        node_name: String,
-        stored_uid: Option<String>,
-    ) -> Result<(), String> {
-        let nodes: kube::Api<k8s_openapi::api::core::v1::Node> =
-            kube::Api::all(self.substrate.kubernetes().k8s.client.clone());
-        match tokio::time::timeout(NODE_LOOKUP_TIMEOUT, nodes.get_opt(&node_name)).await {
-            Ok(Ok(None)) => return Ok(()),
-            Ok(Ok(Some(node))) => {
-                if let (Some(stored), Some(current)) =
-                    (stored_uid.as_deref(), node.metadata.uid.as_deref())
-                    && stored != current
-                {
-                    return Err(format!(
-                        "the Kubernetes Node {node_name} is another one than the drained \
-                         node registered; not lifting its cordon"
-                    ));
-                }
-            }
-            Ok(Err(error)) => return Err(error.to_string()),
-            Err(_) => return Err("the Node lookup timed out".to_owned()),
-        }
-        match tokio::time::timeout(
-            NODE_LOOKUP_TIMEOUT,
-            self.substrate.kubernetes().set_node_schedulability(
-                NodeSchedulabilityRequest {
-                    substrate_node_id: &node_name,
-                },
-                NodeSchedulability::Schedulable,
-            ),
-        )
-        .await
-        {
-            Ok(result) => result.map_err(|error| error.to_string()),
-            Err(_) => Err("lifting the cordon timed out".to_owned()),
-        }
-    }
-}
-
-impl DrainV2Sink for SubstrateSink {
+impl DrainV2Sink for V2Sink {
     async fn list_v2_nodes(&self) -> Result<Vec<V2Node>, String> {
         list_v2_nodes(&self.pool)
             .await
             .map_err(|error| error.to_string())
     }
 
-    async fn ensure_cordon(&self, node_id: NodeId) -> Result<(), CordonFailure> {
-        NodeDrainSink::ensure_node_unschedulable(self, node_id)
+    async fn ensure_cordon(&self, node: &V2Node) -> Result<(), CordonFailure> {
+        if !self
+            .still_listed(node)
             .await
-            .map(|_| ())
-            .map_err(|error| match error {
-                CordonError::StaleIdentity => CordonFailure::UidMismatch(error.to_string()),
-                error => CordonFailure::Other(error.to_string()),
+            .map_err(CordonFailure::Other)?
+        {
+            return Err(CordonFailure::Moved);
+        }
+        let Some(node_name) = node.k8s_node_name.as_deref() else {
+            return Err(CordonFailure::Other(format!(
+                "node {} has no Kubernetes name to cordon",
+                node.id
+            )));
+        };
+        set_v2_node_schedulability(&self.nodes(), node_name, node.k8s_node_uid.as_deref(), true)
+            .await
+            .map_err(|failure| match failure {
+                PatchFailure::AnotherNode(error) => CordonFailure::UidMismatch(error),
+                PatchFailure::Other(error) => CordonFailure::Other(error),
             })
     }
 
     async fn drain_node(
         &self,
-        node_id: NodeId,
+        node: &V2Node,
         request: DrainNodeRequest,
     ) -> Result<DrainNodeResponse, DrainCallError> {
+        if !self
+            .still_listed(node)
+            .await
+            .map_err(DrainCallError::other)?
+        {
+            return Err(DrainCallError::moved());
+        }
+        let node_id = node.id;
         let target = node_api_row(&self.pool, node_id)
             .await
             .map_err(|error| {
@@ -448,7 +577,7 @@ impl DrainV2Sink for SubstrateSink {
             })?
             .ok_or_else(|| DrainCallError::other(format!("node {node_id} not found")))?;
         let mut client = connect_internal_node_api_client_for_target(
-            self.substrate.kubernetes(),
+            self.substrate.as_ref(),
             &target.as_target(),
             DRAIN_NODE_TIMEOUT,
         )
@@ -511,13 +640,18 @@ impl DrainV2Sink for SubstrateSink {
             .map_err(|error| error.to_string())
     }
 
-    async fn finish_cancel(&self, node_id: NodeId, generation: u64) -> Result<bool, String> {
-        finish_v2_cancel_locked(
-            &self.pool,
-            node_id,
-            generation_i64(generation)?,
-            |node_name, uid| self.uncordon_v2_node(node_name, uid),
-        )
+    async fn finish_cancel(&self, node: &V2Node) -> Result<bool, String> {
+        let nodes = self.nodes();
+        finish_v2_cancel_after_lift(&self.pool, node, |node_name, uid| async move {
+            set_v2_node_schedulability(&nodes, &node_name, uid.as_deref(), false)
+                .await
+                .map_err(|failure| match failure {
+                    PatchFailure::AnotherNode(error) => {
+                        format!("{error}; not lifting its cordon")
+                    }
+                    PatchFailure::Other(error) => error,
+                })
+        })
         .await
     }
 
@@ -589,8 +723,7 @@ impl DrainV2Sink for SubstrateSink {
     }
 
     async fn node_exists(&self, k8s_node_name: &str) -> Result<bool, String> {
-        let nodes: kube::Api<k8s_openapi::api::core::v1::Node> =
-            kube::Api::all(self.substrate.kubernetes().k8s.client.clone());
+        let nodes = self.nodes();
         match tokio::time::timeout(NODE_LOOKUP_TIMEOUT, nodes.get_opt(k8s_node_name)).await {
             Ok(Ok(node)) => Ok(node.is_some()),
             Ok(Err(error)) => Err(error.to_string()),
@@ -599,8 +732,7 @@ impl DrainV2Sink for SubstrateSink {
     }
 
     async fn node_machine(&self, k8s_node_name: &str) -> Result<NodeMachine, String> {
-        let nodes: kube::Api<k8s_openapi::api::core::v1::Node> =
-            kube::Api::all(self.substrate.kubernetes().k8s.client.clone());
+        let nodes = self.nodes();
         match tokio::time::timeout(NODE_LOOKUP_TIMEOUT, nodes.get_opt(k8s_node_name)).await {
             Ok(Ok(None)) => Ok(NodeMachine::Gone),
             Ok(Ok(Some(node))) => Ok(NodeMachine::Live(

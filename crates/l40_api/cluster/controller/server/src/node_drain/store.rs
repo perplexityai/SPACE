@@ -1490,19 +1490,6 @@ impl SubstrateSink {
         }
     }
 
-    /// The v2 drain loop's sink ([`super::v2::DrainV2Sink`]). It reads none
-    /// of v1's drain configuration, so it carries the defaults.
-    pub fn v2(pool: PgPool, substrate: Arc<KubernetesSubstrate>) -> Self {
-        Self::new(
-            pool,
-            substrate,
-            ResidencyEvidence::default(),
-            false,
-            false,
-            false,
-        )
-    }
-
     #[cfg(test)]
     fn with_suspend_execution<F, Fut>(pool: PgPool, suspend: F) -> Self
     where
@@ -5007,6 +4994,7 @@ mod tombstone_tests;
 mod v2_skip_tests;
 
 pub(crate) mod v2_sink;
+pub use v2_sink::V2Sink;
 
 /// Postgres-backed regression tests for the durable-upload drain gate: a node
 /// must not be reclaimed (nor its sandbox marked `failed`) while a

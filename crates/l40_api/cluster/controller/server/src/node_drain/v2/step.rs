@@ -333,7 +333,9 @@ pub(super) async fn step<S: DrainV2Sink, A: V2InstanceAuthority>(
         // makes no node call, and counts evacuated every row still naming it
         // that the terminate would release.
         Some("drained") => {
-            let _ = converge_cordon(sink, node).await;
+            if let Err(NoCall::Moved) = converge_cordon(sink, node).await {
+                return None;
+            }
             count_drained(sink, node.id, generation).await;
             None
         }
@@ -418,6 +420,8 @@ enum DrainAnswer {
     Report(DrainReport),
     /// Another `DrainNode` call was in progress on the node.
     Aborted,
+    /// No call was made: the row moved on since the tick listed it.
+    Moved,
     /// The call failed, or the answer isn't the drain's: why.
     Failed(String),
 }
@@ -426,7 +430,7 @@ enum DrainAnswer {
 /// passed.
 async fn call_drain<S: DrainV2Sink>(sink: &S, node: &V2Node, generation: u64) -> DrainAnswer {
     match sink
-        .drain_node(node.id, drain_request(generation, node.evacuate))
+        .drain_node(node, drain_request(generation, node.evacuate))
         .await
     {
         Ok(response) => match drain_report(&response, generation) {
@@ -434,6 +438,7 @@ async fn call_drain<S: DrainV2Sink>(sink: &S, node: &V2Node, generation: u64) ->
             Err(why) => DrainAnswer::Failed(format!("{why}; it records nothing from the answer")),
         },
         Err(error) if error.aborted() => DrainAnswer::Aborted,
+        Err(error) if error.is_moved() => DrainAnswer::Moved,
         Err(error) => DrainAnswer::Failed(format!("DrainNode failed: {error}")),
     }
 }
@@ -480,27 +485,38 @@ async fn store<S: DrainV2Sink>(
     }
 }
 
+/// Why the cordon's convergence leaves the node uncalled this tick.
+enum NoCall {
+    /// The Kubernetes Node under the name is another one than the drain's;
+    /// recorded as the node's last error.
+    AnotherNode(String),
+    /// The row moved on since the tick listed it; nothing recorded.
+    Moved,
+}
+
 /// Converge `node`'s cordon ([`DrainV2Sink::ensure_cordon`]): a v2 node
 /// stays cordoned in every phase where it may still be sealed, `draining`,
 /// `drained`, `terminating` and its cancel pending, so nothing is placed on
 /// it. Each failure is recorded as the node's last error. `Err` when the
-/// Kubernetes Node under the name has another UID than the one registration
-/// recorded: the drain's node isn't the one a call would reach, so the
-/// caller makes no call. `Ok(Some(error))` for any other failure, which the
-/// caller goes on past; `Ok(None)` once converged.
+/// Kubernetes Node under the name has another UID than the one the tick
+/// listed: the drain's node isn't the one a call would reach, so the caller
+/// makes no call; and, recording nothing, when the row moved on since the
+/// tick listed it. `Ok(Some(error))` for any other failure, which the caller
+/// goes on past; `Ok(None)` once converged.
 async fn converge_cordon<S: DrainV2Sink>(
     sink: &S,
     node: &V2Node,
-) -> Result<Option<String>, String> {
-    match sink.ensure_cordon(node.id).await {
+) -> Result<Option<String>, NoCall> {
+    match sink.ensure_cordon(node).await {
         Ok(()) => Ok(None),
+        Err(CordonFailure::Moved) => Err(NoCall::Moved),
         Err(CordonFailure::UidMismatch(error)) => {
             sink.record_error(
                 node.id,
                 &format!("cordon convergence failed: {error}; not calling DrainNode"),
             )
             .await;
-            Err(error)
+            Err(NoCall::AnotherNode(error))
         }
         Err(CordonFailure::Other(error)) => {
             let error = format!("cordon convergence failed: {error}");
@@ -532,6 +548,7 @@ async fn drain<S: DrainV2Sink>(
             );
             return false;
         }
+        DrainAnswer::Moved => return false,
         DrainAnswer::Failed(error) => {
             crate::metrics::node_drain::v2_unanswered(&node.id.to_string());
             sink.record_error(node.id, &error).await;
@@ -605,10 +622,13 @@ async fn terminate<S: DrainV2Sink, A: V2InstanceAuthority>(
             .await;
         return None;
     }
-    let refused = if let Err(error) = converge_cordon(sink, node).await {
-        format!("terminate refused: cordon convergence failed: {error}; not calling DrainNode")
-    } else {
-        match call_drain(sink, node, generation).await {
+    let refused = match converge_cordon(sink, node).await {
+        Err(NoCall::Moved) => return None,
+        Err(NoCall::AnotherNode(error)) => {
+            format!("terminate refused: cordon convergence failed: {error}; not calling DrainNode")
+        }
+        Ok(_) => {
+            match call_drain(sink, node, generation).await {
             DrainAnswer::Report(report) => {
                 let grew_at = evacuated_grew_at(node, &report);
                 let (recording, stored) = store(sink, node, generation, &report, grew_at).await?;
@@ -647,7 +667,9 @@ async fn terminate<S: DrainV2Sink, A: V2InstanceAuthority>(
              node"
                     .to_owned()
             }
+            DrainAnswer::Moved => return None,
             DrainAnswer::Failed(error) => format!("terminate refused: {error}"),
+        }
         }
     };
     match sink.return_drained(node.id, generation, &refused).await {
@@ -689,21 +711,23 @@ fn first_reasons(report: &DrainReport) -> String {
 /// Cancel an undrained node's generation: the node unseals and hands
 /// nothing back. Its cordon is converged first, since the node may still be
 /// sealed; a Node under the name with another UID is not called, and the
-/// next tick retries. Once it answers the cancel, lift the cordon, which
-/// `:undrain` leaves on a v2 node so that nothing is placed on a node still
-/// sealed, and clear the v2 columns, both only while the row is still this
-/// generation's cancel ([`DrainV2Sink::finish_cancel`]). Anything but a
+/// next tick retries, and a row that moved on since the tick listed it is
+/// skipped. Once it answers the cancel, lift the cordon, which `:undrain`
+/// leaves on a v2 node so that nothing is placed on a node still sealed,
+/// then clear the v2 columns, only after the lift and while the row is
+/// still this generation's cancel ([`DrainV2Sink::finish_cancel`]). Anything but a
 /// cancel's answer, an `Aborted` call included, is unanswered and retried
 /// next tick. Returns whether the columns were cleared.
 async fn cancel<S: DrainV2Sink>(sink: &S, node: &V2Node, generation: u64) -> bool {
     if converge_cordon(sink, node).await.is_err() {
         return false;
     }
-    let unanswered = match sink.drain_node(node.id, cancel_request(generation)).await {
+    let unanswered = match sink.drain_node(node, cancel_request(generation)).await {
         Ok(DrainNodeResponse {
             result: Some(drain_node_response::Result::Cancel(_)),
             ..
         }) => None,
+        Err(error) if error.is_moved() => return false,
         Ok(_) => Some(format!(
             "the node answered the cancel of generation {generation} without a cancel's result"
         )),
@@ -714,7 +738,7 @@ async fn cancel<S: DrainV2Sink>(sink: &S, node: &V2Node, generation: u64) -> boo
         sink.record_error(node.id, &error).await;
         return false;
     }
-    match sink.finish_cancel(node.id, generation).await {
+    match sink.finish_cancel(node).await {
         Ok(cleared) => {
             if cleared {
                 crate::metrics::node_drain::clear_v2_gauges(&node.id.to_string());

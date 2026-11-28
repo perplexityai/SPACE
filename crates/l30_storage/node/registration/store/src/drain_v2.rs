@@ -45,6 +45,12 @@ pub struct StoredV2Status {
     /// else the recorded one) `terminated`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminated_observed_at: Option<i64>,
+    /// The instance [`Self::terminated_observed_at`] is about: the stamp
+    /// counts only while the drain asks about that instance. A stamp without
+    /// one, written before the key existed, counts for whichever instance
+    /// the drain asks about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminated_observed_instance: Option<String>,
     /// The last report the controller stored under [`Self::generation`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<StoredV2Report>,
@@ -391,7 +397,10 @@ pub struct V2NodeRow {
     pub fence: Option<String>,
     /// `drain_status.dispatched_at`.
     pub dispatched_at: Option<i64>,
-    /// `drain_status.terminated_observed_at`.
+    /// `drain_status.terminated_observed_at`, while it counts for the
+    /// instance the drain asks about (its fence, else its recorded
+    /// instance): `None` once `drain_status.terminated_observed_instance`
+    /// names another one.
     pub terminated_observed_at: Option<i64>,
     pub decrement_capacity: bool,
     /// The database clock when the listing read the row, in Unix seconds:
@@ -428,7 +437,13 @@ static LIST_V2_NODES: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| 
                 {fresh} AS heartbeat_fresh,
                 {FENCE} AS fence,
                 (n.drain_status->>'dispatched_at')::BIGINT AS dispatched_at,
-                (n.drain_status->>'terminated_observed_at')::BIGINT AS terminated_observed_at,
+                CASE
+                    WHEN COALESCE(
+                             n.drain_status->>'terminated_observed_instance',
+                             COALESCE({FENCE}, k.instance_id)
+                         ) IS NOT DISTINCT FROM COALESCE({FENCE}, k.instance_id)
+                    THEN (n.drain_status->>'terminated_observed_at')::BIGINT
+                END AS terminated_observed_at,
                 n.terminate_decrement_capacity AS decrement_capacity,
                 FLOOR(EXTRACT(EPOCH FROM NOW()))::BIGINT AS db_now
            FROM nodes n
@@ -489,6 +504,9 @@ pub struct LockedV2Node {
     pub generation: Option<i64>,
     pub fence: Option<String>,
     pub dispatched: bool,
+    /// The row records that EC2 listed the instance the drain asks about
+    /// (its fence, else its recorded instance) `terminated`: a stamp about
+    /// another instance doesn't count.
     pub terminated_observed: bool,
     pub k8s_node_name: Option<String>,
     pub k8s_node_uid: Option<String>,
@@ -502,7 +520,14 @@ static LOCKED_V2_NODE: std::sync::LazyLock<String> = std::sync::LazyLock::new(||
                 (n.drain_status->>'generation')::BIGINT AS generation,
                 {FENCE} AS fence,
                 COALESCE(n.drain_status ? 'dispatched_at', FALSE) AS dispatched,
-                COALESCE(n.drain_status ? 'terminated_observed_at', FALSE) AS terminated_observed,
+                COALESCE(
+                    n.drain_status ? 'terminated_observed_at'
+                        AND COALESCE(
+                                n.drain_status->>'terminated_observed_instance',
+                                COALESCE({FENCE}, k.instance_id)
+                            ) IS NOT DISTINCT FROM COALESCE({FENCE}, k.instance_id),
+                    FALSE
+                ) AS terminated_observed,
                 k.k8s_node_name, k.k8s_node_uid, k.instance_id
            FROM nodes n
            LEFT JOIN node_k8s k ON k.node_id = n.id
@@ -540,6 +565,44 @@ impl LockedV2Node {
             && self.drain_phase.is_none()
             && self.generation == Some(generation)
     }
+}
+
+/// Whether `node_id`'s row is still the v2 drain a listing read: the v2
+/// engine in `phase` (`None`: a cancel pending) under `generation`, on the
+/// machine registration recorded then, `k8s_node_uid` and `instance_id` as
+/// listed (either may be absent). An undrain or another phase change moves
+/// the phase; a registration that takes the row for another machine changes
+/// the UID or the instance, or clears the drain. Takes no lock: the loop
+/// reads it just before an effect on the node, a Kubernetes patch or a
+/// `DrainNode` call, which no row lock may span.
+pub async fn v2_node_as_listed(
+    executor: impl Executor<'_>,
+    node_id: NodeId,
+    phase: Option<&str>,
+    generation: i64,
+    k8s_node_uid: Option<&str>,
+    instance_id: Option<&str>,
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM nodes n
+               LEFT JOIN node_k8s k ON k.node_id = n.id
+              WHERE n.id = $1
+                AND n.drain_engine = 'v2'
+                AND (n.drain_status->>'generation')::BIGINT = $2
+                AND k.k8s_node_uid IS NOT DISTINCT FROM $3::TEXT
+                AND k.instance_id IS NOT DISTINCT FROM $4::TEXT
+                AND n.drain_phase IS NOT DISTINCT FROM $5::TEXT
+         )"
+    ))
+    .bind(node_id)
+    .bind(generation)
+    .bind(k8s_node_uid)
+    .bind(instance_id)
+    .bind(phase)
+    .fetch_one(executor.into_sqlx())
+    .await?)
 }
 
 /// Record what holds the locked node from its terminate transaction's fence
@@ -613,19 +676,22 @@ pub async fn record_v2_dispatched(
 
 /// `$1` = node id, `$2` = generation, `$3` = the instance EC2 was asked
 /// about. Records, by the database clock in Unix seconds, that EC2 listed it
-/// `terminated`, keeping the first time, on a row whose drain asks about
-/// that instance: its fence once written, else the instance its
-/// registration recorded.
+/// `terminated`, with the instance, on a row whose drain asks about that
+/// instance: its fence once written, else the instance its registration
+/// recorded. Keeps the first time of a stamp about that instance, or of one
+/// that names none; replaces a stamp about another instance.
 static RECORD_TERMINATED_OBSERVED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     sql!(format!(
         "UPDATE nodes n
-                SET drain_status = n.drain_status || jsonb_build_object(
-                        'terminated_observed_at',
-                        COALESCE(
-                            n.drain_status->'terminated_observed_at',
-                            to_jsonb(EXTRACT(EPOCH FROM NOW())::BIGINT)
+                SET drain_status = n.drain_status || CASE
+                        WHEN n.drain_status ? 'terminated_observed_at'
+                             AND COALESCE(n.drain_status->>'terminated_observed_instance', $3) = $3
+                        THEN '{{}}'::JSONB
+                        ELSE jsonb_build_object(
+                            'terminated_observed_at', EXTRACT(EPOCH FROM NOW())::BIGINT,
+                            'terminated_observed_instance', $3::TEXT
                         )
-                    )
+                    END
               WHERE n.id = $1
                 AND n.drain_engine = 'v2'
                 AND (n.drain_status->>'generation')::BIGINT = $2
@@ -638,9 +704,12 @@ static RECORD_TERMINATED_OBSERVED: std::sync::LazyLock<String> = std::sync::Lazy
 
 /// Record that EC2 listed `instance_id`, the instance the v2 drain under
 /// `generation` asks about (its fence, else its recorded instance),
-/// `terminated`: EC2 stops listing a terminated instance after a while, and
-/// the let-go and the delete of the row need this record when it no longer
-/// does. Keeps the first time. False for a row that is no longer that
+/// `terminated`, in `drain_status.terminated_observed_at` and
+/// `drain_status.terminated_observed_instance`: EC2 stops listing a
+/// terminated instance after a while, and the let-go and the delete of the
+/// row need this record when it no longer does. Keeps the first time of a
+/// record about that instance, or of one that names no instance; replaces
+/// one about another instance. False for a row that is no longer that
 /// generation's v2 drain asking about that instance.
 pub async fn record_v2_terminated_observed(
     executor: impl Executor<'_>,

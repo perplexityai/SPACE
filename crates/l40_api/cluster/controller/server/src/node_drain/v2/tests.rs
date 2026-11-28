@@ -52,9 +52,31 @@ struct FakeSink {
     /// The bound of each count of sandboxes left suspended, in seconds, in
     /// order; kept out of `calls`, since every tick makes one.
     counted: Mutex<Vec<u64>>,
+    /// When set, a registration replaces every node's machine right after
+    /// the listing, under this Kubernetes UID: the row no longer reads as
+    /// the tick listed it.
+    replaced_after_listing: Option<String>,
+    /// When set, a registration replaces a node's machine right after its
+    /// cordon converged, under this Kubernetes UID: the cordon went through,
+    /// and the row no longer reads as listed for the effects after it.
+    replaced_after_cordon: Option<String>,
+    /// The UID each node's row carries now, once a registration replaced it.
+    registered_uid: Mutex<HashMap<NodeId, String>>,
+    /// When set, each Node GET takes this long.
+    node_lookup_takes: Option<Duration>,
 }
 
 impl FakeSink {
+    /// Whether `node`'s row still reads as the tick listed it: no
+    /// registration replaced its machine since.
+    fn still_listed(&self, node: &V2Node) -> bool {
+        self.registered_uid
+            .lock()
+            .unwrap()
+            .get(&node.id)
+            .is_none_or(|uid| node.k8s_node_uid.as_ref() == Some(uid))
+    }
+
     fn log(&self, entry: String) {
         self.calls.lock().unwrap().push(entry);
     }
@@ -84,19 +106,38 @@ impl FakeSink {
 
 impl DrainV2Sink for FakeSink {
     async fn list_v2_nodes(&self) -> Result<Vec<V2Node>, String> {
+        if let Some(uid) = &self.replaced_after_listing {
+            self.registered_uid
+                .lock()
+                .unwrap()
+                .extend(self.nodes.iter().map(|node| (node.id, uid.clone())));
+        }
         Ok(self.nodes.clone())
     }
 
-    async fn ensure_cordon(&self, node_id: NodeId) -> Result<(), CordonFailure> {
-        self.log(format!("cordon {node_id}"));
+    async fn ensure_cordon(&self, node: &V2Node) -> Result<(), CordonFailure> {
+        if !self.still_listed(node) {
+            return Err(CordonFailure::Moved);
+        }
+        self.log(format!("cordon {}", node.id));
+        if let Some(uid) = &self.replaced_after_cordon {
+            self.registered_uid
+                .lock()
+                .unwrap()
+                .insert(node.id, uid.clone());
+        }
         self.cordon_error.clone().map_or(Ok(()), Err)
     }
 
     async fn drain_node(
         &self,
-        node_id: NodeId,
+        node: &V2Node,
         request: DrainNodeRequest,
     ) -> Result<DrainNodeResponse, DrainCallError> {
+        if !self.still_listed(node) {
+            return Err(DrainCallError::moved());
+        }
+        let node_id = node.id;
         self.requests.lock().unwrap().push(request);
         let cancel = matches!(request.op, Some(drain_node_request::Op::Cancel(_)));
         self.log(format!(
@@ -165,8 +206,12 @@ impl DrainV2Sink for FakeSink {
         Ok(true)
     }
 
-    async fn finish_cancel(&self, node_id: NodeId, generation: u64) -> Result<bool, String> {
-        self.log(format!("finish_cancel {node_id} {generation}"));
+    async fn finish_cancel(&self, node: &V2Node) -> Result<bool, String> {
+        if !self.still_listed(node) {
+            return Ok(false);
+        }
+        let generation = node.generation.expect("a listed cancel has a generation");
+        self.log(format!("finish_cancel {} {generation}", node.id));
         self.finish_cancel.clone().unwrap_or(Ok(true))
     }
 
@@ -221,6 +266,9 @@ impl DrainV2Sink for FakeSink {
 
     async fn node_exists(&self, k8s_node_name: &str) -> Result<bool, String> {
         self.log(format!("node_exists {k8s_node_name}"));
+        if let Some(takes) = self.node_lookup_takes {
+            tokio::time::sleep(takes).await;
+        }
         Ok(self.nodes_present.iter().any(|name| name == k8s_node_name))
     }
 
@@ -259,8 +307,13 @@ struct FakeAuthority {
     terminates: bool,
     answers: HashMap<String, InstanceEvidence>,
     terminate: Result<(), String>,
+    /// Every instance asked about, in order, across calls.
     described: Mutex<Vec<String>>,
+    /// How many `describe_instances` calls were made.
+    describe_calls: Mutex<usize>,
     terminated: Mutex<Vec<(String, bool)>>,
+    /// How long each `terminate_instance` call takes.
+    terminate_takes: Option<Duration>,
 }
 
 impl FakeAuthority {
@@ -270,7 +323,9 @@ impl FakeAuthority {
             answers: HashMap::new(),
             terminate: Ok(()),
             described: Mutex::default(),
+            describe_calls: Mutex::default(),
             terminated: Mutex::default(),
+            terminate_takes: None,
         }
     }
 
@@ -295,12 +350,26 @@ impl V2InstanceAuthority for FakeAuthority {
         self.terminates
     }
 
-    async fn describe_instance(&self, instance_id: &str) -> InstanceEvidence {
-        self.described.lock().unwrap().push(instance_id.to_owned());
-        self.answers
-            .get(instance_id)
-            .cloned()
-            .unwrap_or_else(|| InstanceEvidence::Listed("running".to_owned()))
+    async fn describe_instances(
+        &self,
+        instance_ids: &[String],
+    ) -> HashMap<String, InstanceEvidence> {
+        *self.describe_calls.lock().unwrap() += 1;
+        self.described
+            .lock()
+            .unwrap()
+            .extend(instance_ids.iter().cloned());
+        instance_ids
+            .iter()
+            .map(|instance_id| {
+                let answer = self
+                    .answers
+                    .get(instance_id)
+                    .cloned()
+                    .unwrap_or_else(|| InstanceEvidence::Listed("running".to_owned()));
+                (instance_id.clone(), answer)
+            })
+            .collect()
     }
 
     async fn terminate_instance(
@@ -312,6 +381,9 @@ impl V2InstanceAuthority for FakeAuthority {
             .lock()
             .unwrap()
             .push((instance_id.to_owned(), decrement_capacity));
+        if let Some(takes) = self.terminate_takes {
+            tokio::time::sleep(takes).await;
+        }
         self.terminate.clone()
     }
 }
@@ -1919,8 +1991,8 @@ async fn an_answer_not_under_the_drains_generation_records_nothing() {
 }
 
 /// A cancel pending (a v2 row with no phase) sends `Cancel` under its
-/// generation, and only a cancel's answer finishes it: the cordon's lift
-/// and the clear of the columns, under the row's lock and only while the
+/// generation, and only a cancel's answer finishes it: the cordon's lift,
+/// then the clear of the columns once the lift succeeded, only while the
 /// row is still this generation's cancel. A drain-shaped answer, a call
 /// that fails, and an `Aborted` one are unanswered: the error is recorded,
 /// and the next tick asks again; so is a finish that
@@ -2403,4 +2475,233 @@ fn the_loop_config_reads_its_test_hooks() {
         config(&[(DISPATCH_BACKOFF_BASE_TEST_ENV, "600")]).dispatch_backoff_base,
         DISPATCH_BACKOFF_CAP
     );
+}
+
+/// A registration that replaces a node's machine after the tick listed it,
+/// before its step, leaves the step with nothing to act on: in every phase
+/// that cordons or calls the node, nothing is cordoned, no `DrainNode` call
+/// or lift is made, a drained node's evacuations aren't counted, no error
+/// is recorded and no terminate is refused. The next listing decides.
+#[tokio::test]
+async fn a_registration_replaced_after_the_listing_gets_no_effect() {
+    for (case, phase) in [
+        ("draining", Some("draining")),
+        ("drained", Some("drained")),
+        ("terminating", Some("terminating")),
+        ("cancel", None),
+    ] {
+        let target = node(phase, Some(5));
+        let sink = FakeSink {
+            nodes: vec![target.clone()],
+            responses: HashMap::from([
+                ((target.id, false), Ok(response(5, &[]))),
+                ((target.id, true), Ok(cancelled(5))),
+            ]),
+            replaced_after_listing: Some("uid-replacement".to_owned()),
+            ..FakeSink::default()
+        };
+        let report = run_tick(&sink, &FakeAuthority::ok()).await;
+        assert_eq!(report, V2TickReport::default(), "{case}");
+        assert!(sink.requests().is_empty(), "{case}");
+        let calls = sink.calls();
+        for effect in [
+            "cordon",
+            "drain_node",
+            "finish_cancel",
+            "count_drained",
+            "error",
+            "return",
+            "fence",
+        ] {
+            assert!(
+                !called(&sink, effect, &target),
+                "{case}: {effect}: {calls:?}"
+            );
+        }
+    }
+}
+
+/// A registration that keeps the drain (the same instance, say) but lands
+/// between a node's cordon and the call after it leaves the step with
+/// nothing more to act on: the cordon went through, and no `DrainNode` call
+/// is made, no lift, report or error recorded, and no terminate refused or
+/// fenced. The next listing decides.
+#[tokio::test]
+async fn a_registration_replaced_after_the_cordon_gets_no_further_effect() {
+    for (case, phase) in [
+        ("draining", Some("draining")),
+        ("terminating", Some("terminating")),
+        ("cancel", None),
+    ] {
+        let target = node(phase, Some(5));
+        let sink = FakeSink {
+            nodes: vec![target.clone()],
+            responses: HashMap::from([
+                ((target.id, false), Ok(response(5, &[]))),
+                ((target.id, true), Ok(cancelled(5))),
+            ]),
+            replaced_after_cordon: Some("uid-replacement".to_owned()),
+            ..FakeSink::default()
+        };
+        let report = run_tick(&sink, &FakeAuthority::ok()).await;
+        assert_eq!(report, V2TickReport::default(), "{case}");
+        assert!(sink.requests().is_empty(), "{case}");
+        let calls = sink.calls();
+        assert!(called(&sink, "cordon", &target), "{case}: {calls:?}");
+        for effect in [
+            "drain_node",
+            "finish_cancel",
+            "error",
+            "report",
+            "return",
+            "fence",
+        ] {
+            assert!(
+                !called(&sink, effect, &target),
+                "{case}: {effect}: {calls:?}"
+            );
+        }
+    }
+}
+
+/// A tick asks EC2 once, about every instance it asks about, however many
+/// nodes ask: each stale unfenced node and each fenced one. Each node reads
+/// the answer for its own instance: one EC2 doesn't list doesn't hide
+/// another's `terminated`.
+#[tokio::test]
+async fn a_tick_asks_ec2_once_for_every_node() {
+    const TERMINATED: &str = "i-000000000000a0a0a";
+    const UNKNOWN: &str = "i-000000000000b0b0b";
+    let stale = |instance: &str| V2Node {
+        instance_id: Some(instance.to_owned()),
+        heartbeat_fresh: false,
+        ..node(Some("drained"), Some(5))
+    };
+    let terminated = stale(TERMINATED);
+    let unknown = stale(UNKNOWN);
+    let running = stale(INSTANCE);
+    let fenced = V2Node {
+        fence: Some("i-000000000000c0c0c".to_owned()),
+        ..fenced(true)
+    };
+    let sink = FakeSink {
+        nodes: vec![
+            terminated.clone(),
+            unknown.clone(),
+            running.clone(),
+            fenced.clone(),
+        ],
+        ..FakeSink::default()
+    };
+    let authority = FakeAuthority {
+        answers: HashMap::from([
+            (TERMINATED.to_owned(), InstanceEvidence::Terminated),
+            (UNKNOWN.to_owned(), InstanceEvidence::NotListed),
+        ]),
+        ..FakeAuthority::ok()
+    };
+    let report = run_tick(&sink, &authority).await;
+    assert_eq!(*authority.describe_calls.lock().unwrap(), 1);
+    let mut described = authority.described();
+    described.sort();
+    assert_eq!(
+        described,
+        [
+            INSTANCE,
+            "i-000000000000a0a0a",
+            "i-000000000000b0b0b",
+            "i-000000000000c0c0c",
+        ]
+    );
+    assert_eq!(report.let_go, [terminated.id]);
+    for kept in [&unknown, &running] {
+        assert!(!called(&sink, "let_go", kept), "{:?}", sink.calls());
+    }
+}
+
+/// EC2's answer for each instance one call asked about, from what it listed:
+/// an instance it doesn't list is not listed, beside the others' answers,
+/// and one listed twice may still run.
+#[test]
+fn one_ec2_answer_reads_per_instance() {
+    let listed = |instance_id: &str, state: &str| pplx_space_aws_client::ec2::Instance {
+        instance_id: instance_id.to_owned(),
+        state: state.to_owned(),
+    };
+    let answers = evidence_by_id(
+        &["i-a", "i-b", "i-c", "i-d"],
+        vec![
+            listed("i-b", "terminated"),
+            listed("i-c", "running"),
+            listed("i-c", "running"),
+            listed("i-d", "shutting-down"),
+            listed("i-z", "terminated"),
+        ],
+    );
+    assert_eq!(
+        answers,
+        HashMap::from([
+            ("i-a".to_owned(), InstanceEvidence::NotListed),
+            ("i-b".to_owned(), InstanceEvidence::Terminated),
+            (
+                "i-c".to_owned(),
+                InstanceEvidence::Listed("listed 2 times".to_owned())
+            ),
+            ("i-d".to_owned(), InstanceEvidence::ShuttingDown),
+        ])
+    );
+}
+
+/// A fenced node's next check waits out the backoff from when its step
+/// finished waiting on its calls, not from when the step started: a Node
+/// lookup, or an Auto Scaling call, that takes longer than the backoff
+/// doesn't let the next tick ask again at once.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_backoff_counts_from_after_the_calls_it_waited_on() {
+    let config = V2LoopConfig {
+        dispatch_backoff_base: Duration::from_secs(3),
+        ..V2LoopConfig::default()
+    };
+
+    let undispatched = fenced(false);
+    let sink = FakeSink {
+        nodes: vec![undispatched],
+        ..FakeSink::default()
+    };
+    let authority = FakeAuthority {
+        terminate_takes: Some(Duration::from_secs(10)),
+        ..FakeAuthority::answering(InstanceEvidence::Listed("running".to_owned()))
+    };
+    let state = V2LoopState::new(config);
+    tick(&sink, &authority, &state).await;
+    assert_eq!(
+        authority.terminated().len(),
+        1,
+        "the termination is dispatched"
+    );
+    tick(&sink, &authority, &state).await;
+    assert_eq!(
+        authority.described().len(),
+        1,
+        "the backoff holds the ask after the Auto Scaling call"
+    );
+    tokio::time::advance(config.dispatch_backoff_base).await;
+    tick(&sink, &authority, &state).await;
+    assert_eq!(authority.described().len(), 2, "the backoff ran out");
+
+    let node = fenced(true);
+    let sink = FakeSink {
+        nodes: vec![node.clone()],
+        nodes_present: vec![node.k8s_node_name.clone().expect("a name")],
+        node_lookup_takes: Some(Duration::from_secs(10)),
+        ..FakeSink::default()
+    };
+    let authority = FakeAuthority::answering(InstanceEvidence::Terminated);
+    let state = V2LoopState::new(config);
+    tick(&sink, &authority, &state).await;
+    tick(&sink, &authority, &state).await;
+    assert_eq!(authority.described().len(), 1, "the backoff holds the ask");
+    tokio::time::advance(config.dispatch_backoff_base).await;
+    tick(&sink, &authority, &state).await;
+    assert_eq!(authority.described().len(), 2, "the backoff ran out");
 }
