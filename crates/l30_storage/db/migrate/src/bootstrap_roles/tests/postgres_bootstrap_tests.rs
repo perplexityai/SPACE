@@ -276,7 +276,7 @@ async fn fresh_database_bootstraps_migrates_as_migrator_and_fences() -> TestResu
         .fetch_one(&mut user)
         .await?;
     assert!(role_has_table_privilege(&fixture, USER_ROLE, "sandboxes", "INSERT").await?);
-    let fence_error = sqlx::query(sql!("SELECT COUNT(*) FROM user_credentials"))
+    let fence_error = sqlx::query(sql!("SELECT COUNT(*) FROM org_master_keys"))
         .fetch_one(&mut user)
         .await
         .expect_err("space_user must not read credential tables");
@@ -322,7 +322,7 @@ async fn fresh_database_bootstraps_migrates_as_migrator_and_fences() -> TestResu
         .fetch_one(&mut ro)
         .await?;
     assert!(!role_has_table_privilege(&fixture, RO_ROLE, "sandboxes", "INSERT").await?);
-    let ro_fence_error = sqlx::query(sql!("SELECT COUNT(*) FROM user_credentials"))
+    let ro_fence_error = sqlx::query(sql!("SELECT COUNT(*) FROM org_master_keys"))
         .fetch_one(&mut ro)
         .await
         .expect_err("space_ro must not read credential tables");
@@ -331,10 +331,10 @@ async fn fresh_database_bootstraps_migrates_as_migrator_and_fences() -> TestResu
     // space_creds reads and writes everything, credential tables
     // included.
     let mut creds = fixture.connect_as(CREDS_ROLE).await?;
-    sqlx::query(sql!("SELECT COUNT(*) FROM user_credentials"))
+    sqlx::query(sql!("SELECT COUNT(*) FROM org_master_keys"))
         .fetch_one(&mut creds)
         .await?;
-    assert!(role_has_table_privilege(&fixture, CREDS_ROLE, "user_credentials", "INSERT").await?);
+    assert!(role_has_table_privilege(&fixture, CREDS_ROLE, "org_master_keys", "INSERT").await?);
     assert!(role_has_table_privilege(&fixture, CREDS_ROLE, "sandboxes", "UPDATE").await?);
 
     // space_migrator can run DDL on pre-existing and new tables, and
@@ -1089,7 +1089,8 @@ async fn grant_exclusion_keeps_revoked_view_privileges_revoked(
     drop(conn);
 
     let mut admin = fixture.connect_as("postgres").await?;
-    let skipped = converge_grants(&mut admin, &["legacy_fixture"]).await?;
+    let skipped =
+        converge_grants(&mut admin, &["legacy_fixture"], RETIRED_CREDENTIAL_TABLES).await?;
     assert_eq!(skipped, 0);
     for role in [USER_ROLE, RO_ROLE, CREDS_ROLE] {
         assert!(
@@ -1139,7 +1140,7 @@ async fn grant_exclusion_still_fences_denylisted_columns_from_ro(
     );
 
     let mut admin = fixture.connect_as("postgres").await?;
-    let skipped = converge_grants(&mut admin, &["sessions"]).await?;
+    let skipped = converge_grants(&mut admin, &["sessions"], RETIRED_CREDENTIAL_TABLES).await?;
     assert_eq!(skipped, 0);
     assert!(
         !ro_reads_any_column(fixture, "sessions").await?,
@@ -1164,5 +1165,71 @@ async fn grant_exclusion_still_fences_denylisted_columns_from_ro(
             "space_ro SELECT on sessions {column} once the view is not excluded"
         );
     }
+    Ok(())
+}
+
+/// A retired credential table stays fenced whenever it exists. Each table is
+/// created here as `space_migrator`, as a rollback's down migration re-creates
+/// one, so default privileges first grant it to `space_user` and `space_ro`.
+/// The grant pass must then revoke those grants on a retired table and keep
+/// them on an ordinary table created the same way.
+///
+/// The probe is in neither list, so the first pass tells the retired fence
+/// apart from [`CREDENTIAL_TABLES`]. The bootstrap pass checks that a full
+/// bootstrap fences the retired tables. Once a drop has removed them from
+/// [`CREDENTIAL_TABLES`], only [`RETIRED_CREDENTIAL_TABLES`] can, so from then
+/// on it also checks that bootstrap hands that list to the grant pass.
+#[tokio::test]
+async fn retired_credential_tables_stay_fenced_while_present() -> TestResult {
+    const PROBE: &str = "retired_fence_probe";
+    const CONTROL: &str = "retired_fence_control";
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    run_bootstrap(&fixture).await?;
+    let mut migrator = fixture.connect_as(MIGRATOR_ROLE).await?;
+    for table in RETIRED_CREDENTIAL_TABLES.iter().chain(&[PROBE, CONTROL]) {
+        let create = format!("CREATE TABLE {} (id INT)", quote_ident(table));
+        sqlx::query(sqlx::AssertSqlSafe(sql!(create.as_str())))
+            .execute(&mut migrator)
+            .await?;
+        assert!(
+            role_has_table_privilege(&fixture, USER_ROLE, table, "SELECT").await?,
+            "{table}: default privileges grant a new migrator table to {USER_ROLE}"
+        );
+    }
+    assert!(!CREDENTIAL_TABLES.contains(&PROBE) && !RETIRED_CREDENTIAL_TABLES.contains(&PROBE));
+
+    let mut admin = fixture.connect_as("postgres").await?;
+    converge_grants(&mut admin, &[], &[PROBE]).await?;
+    assert_fenced_as_credential_table(&fixture, PROBE).await?;
+    assert!(role_has_table_privilege(&fixture, USER_ROLE, CONTROL, "SELECT").await?);
+    assert!(ro_reads_any_column(&fixture, CONTROL).await?);
+
+    run_bootstrap(&fixture).await?;
+    for table in RETIRED_CREDENTIAL_TABLES {
+        assert_fenced_as_credential_table(&fixture, table).await?;
+    }
+    assert!(role_has_table_privilege(&fixture, USER_ROLE, CONTROL, "SELECT").await?);
+    assert!(ro_reads_any_column(&fixture, CONTROL).await?);
+    Ok(())
+}
+
+/// `table` is fenced like a credential table: only `space_creds` may use it.
+async fn assert_fenced_as_credential_table(fixture: &PostgresFixture, table: &str) -> TestResult {
+    for privilege in ["SELECT", "INSERT", "UPDATE", "DELETE"] {
+        assert!(
+            !role_has_table_privilege(fixture, USER_ROLE, table, privilege).await?,
+            "{USER_ROLE} keeps {privilege} on fenced table {table}"
+        );
+        assert!(
+            role_has_table_privilege(fixture, CREDS_ROLE, table, privilege).await?,
+            "{CREDS_ROLE} lacks {privilege} on fenced table {table}"
+        );
+    }
+    assert!(
+        !ro_reads_any_column(fixture, table).await?,
+        "{RO_ROLE} keeps read access to fenced table {table}"
+    );
     Ok(())
 }

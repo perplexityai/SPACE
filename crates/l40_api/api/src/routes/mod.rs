@@ -31,9 +31,10 @@ pub struct AppState {
     /// on the credential-fenced tables.
     pub pool: PgPool,
     /// Pool pinned to `space_creds`, the login holding grants on the
-    /// credential-fenced tables (`user_credentials`, `org_credentials`,
-    /// `org_master_keys`). Fenced statements — and any transaction that
-    /// mixes them with unfenced ones — must run here instead of `pool`.
+    /// credential-fenced tables (such as `org_master_keys` and the
+    /// `*_encrypted_fields` sidecars). Fenced statements — and any
+    /// transaction that mixes them with unfenced ones — must run here
+    /// instead of `pool`.
     pub credentials_pool: pplx_space_postgres_pool::CredentialsPool,
     pub sandbox_controller: crate::controllers::sandbox::SandboxController,
     pub template_controller: crate::controllers::template::TemplateController,

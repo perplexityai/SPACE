@@ -146,8 +146,8 @@ pub fn connect_space_user_sideline_pool_lazy(
 /// Pool pinned to `space_creds`, the login holding grants on the
 /// credential-fenced tables.
 ///
-/// The credential tables (`user_credentials`, `org_credentials`,
-/// `org_master_keys`, `snapshot_storage_location_encrypted_fields`) are
+/// The credential tables (`CREDENTIAL_TABLES` in the role bootstrap, such as
+/// `org_master_keys` and the `*_encrypted_fields` sidecars) are
 /// deliberately absent from `space_user`'s grants, so statements against
 /// them must never run on a service's general pool. This newtype keeps the
 /// two lanes distinct in signatures: a callsite that needs the fenced lane

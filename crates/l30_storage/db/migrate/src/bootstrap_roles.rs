@@ -86,7 +86,8 @@ const RDS_SUPERUSER_ROLE: &str = "rds_superuser";
 /// have any existing grant revoked on every run. Extend this list in the
 /// same PR as any migration that creates a credential-bearing table — the
 /// bootstrap end-to-end test cross-checks it against `wrapped_dek` columns
-/// in the migrated schema.
+/// in the migrated schema. Before a migration drops one, add its name to
+/// [`RETIRED_CREDENTIAL_TABLES`].
 const CREDENTIAL_TABLES: &[&str] = &[
     "org_master_keys",
     "org_branching_keys",
@@ -98,6 +99,22 @@ const CREDENTIAL_TABLES: &[&str] = &[
     "template_release_storage_location_encrypted_fields",
     "template_encrypted_fields",
     "sandbox_volume_encryption",
+];
+
+/// Credential tables a migration drops, still fenced like
+/// [`CREDENTIAL_TABLES`] whenever one exists: before the drop applies (the
+/// provisioning Job runs bootstrap before migrations) and after a rollback's
+/// down migration re-creates it. Unlike [`CREDENTIAL_TABLES`], a name here
+/// need not exist. Add a name here in a code change ahead of the migration
+/// that drops its table, which may only remove the name from
+/// [`CREDENTIAL_TABLES`]. Delete it only once every database has applied
+/// that drop and no release that can be rolled back to still has the table:
+/// until then a bootstrap can still meet the table, before migrations run or
+/// after a down.
+const RETIRED_CREDENTIAL_TABLES: &[&str] = &[
+    "org_credentials",
+    "sandbox_encrypted_fields",
+    "user_credentials",
 ];
 
 /// Columns holding password/token hashes or replayable bearer material that
@@ -685,7 +702,7 @@ async fn bootstrap(
     skipped += adopt_relation_ownership(conn).await?;
     skipped += adopt_routine_ownership(conn).await?;
     skipped += adopt_type_ownership(conn).await?;
-    skipped += converge_grants(conn, GRANT_EXCLUDED_RELATIONS).await?;
+    skipped += converge_grants(conn, GRANT_EXCLUDED_RELATIONS, RETIRED_CREDENTIAL_TABLES).await?;
     Ok(skipped)
 }
 
@@ -1353,9 +1370,12 @@ async fn converge_schema_privileges(conn: &mut PgConnection) -> Result<usize, Bo
 }
 
 /// Relations in `excluded` receive no grants; see [`GRANT_EXCLUDED_RELATIONS`].
+/// Tables in `retired` are fenced like [`CREDENTIAL_TABLES`] while they exist;
+/// see [`RETIRED_CREDENTIAL_TABLES`].
 async fn converge_grants(
     conn: &mut PgConnection,
     excluded: &[&str],
+    retired: &[&str],
 ) -> Result<usize, BootstrapRolesError> {
     let mut skipped = 0_usize;
 
@@ -1399,7 +1419,8 @@ async fn converge_grants(
     .map_err(BootstrapRolesError::EnumerateRelationsForGrants)?;
     let relations = parse_relations(relations)?;
 
-    let credential_tables: BTreeSet<&str> = CREDENTIAL_TABLES.iter().copied().collect();
+    let credential_tables: BTreeSet<&str> =
+        CREDENTIAL_TABLES.iter().chain(retired).copied().collect();
     let ro_column_denylist: std::collections::BTreeMap<&str, &[&str]> =
         RO_COLUMN_DENYLIST.iter().copied().collect();
     let excluded: BTreeSet<&str> = excluded.iter().copied().collect();

@@ -190,8 +190,6 @@ pub(super) enum UserDeleteBlocker {
     /// `sandboxes.user_id` held only by deleted sandboxes, whose rows
     /// tombstone retention keeps until about `retained_until`.
     DeletedSandboxes { retained_until: OffsetDateTime },
-    /// `sandbox_archives.user_id` (`ON DELETE RESTRICT`).
-    ArchivedSandboxes,
 }
 
 impl UserDeleteBlocker {
@@ -203,7 +201,6 @@ impl UserDeleteBlocker {
         }
         match error.constraint()? {
             "sandboxes_user_id_fkey" => Some(Self::Sandboxes),
-            "sandbox_archives_user_id_fkey" => Some(Self::ArchivedSandboxes),
             _ => None,
         }
     }
@@ -236,7 +233,6 @@ impl UserDeleteBlocker {
         match self {
             Self::Sandboxes => "user_owns_sandboxes",
             Self::DeletedSandboxes { .. } => "user_owns_retained_deleted_sandboxes",
-            Self::ArchivedSandboxes => "user_owns_archived_sandboxes",
         }
     }
 
@@ -250,9 +246,6 @@ impl UserDeleteBlocker {
                  until about {}; retry the delete after that",
                 format_rfc3339(retained_until)
             ),
-            Self::ArchivedSandboxes => "user still owns archived sandboxes; they must be purged \
-                                        before the user can be deleted"
-                .to_string(),
         }
     }
 }
@@ -271,12 +264,11 @@ pub(super) enum OrgDeleteBlocker {
     /// `users.org_id`.
     Users,
     /// `sandboxes.org_id`, which includes deleted sandboxes kept for
-    /// retention. The encrypted-field and volume-encryption rows of the
-    /// organization's sandboxes and snapshots also restrict the delete of the
-    /// master key the organization's delete cascades to.
+    /// retention. The volume-encryption rows of the organization's sandboxes
+    /// also restrict the delete of the master key the organization's delete
+    /// cascades to, as do its encrypted snapshot storage locations while it
+    /// has sandbox rows (see [`Self::OrphanedSnapshotStorage`]).
     Sandboxes,
-    /// `sandbox_archives.org_id` (`ON DELETE RESTRICT`).
-    ArchivedSandboxes,
     /// `templates.org_id`, and the encrypted-field rows of the organization's
     /// templates and template releases through its master key, while at least
     /// one of its templates is not deleted.
@@ -313,13 +305,12 @@ impl OrgDeleteBlocker {
         }
         match error.constraint()? {
             "users_org_id_fkey" => Some(Self::Users),
-            "sandboxes_org_id_fkey"
-            | "sandbox_encrypted_fields_master_key_id_org_id_fkey"
-            | "sandbox_volume_encryption_master_key_id_org_id_fkey" => Some(Self::Sandboxes),
+            "sandboxes_org_id_fkey" | "sandbox_volume_encryption_master_key_id_org_id_fkey" => {
+                Some(Self::Sandboxes)
+            }
             "snapshot_storage_location_encrypted_fields_kek_fkey" => {
                 Some(Self::OrphanedSnapshotStorage)
             }
-            "sandbox_archives_org_id_fkey" => Some(Self::ArchivedSandboxes),
             "templates_org_id_fkey"
             | "template_encrypted_fields_master_key_id_org_id_fkey"
             | "template_release_storage_location_encrypted_fields_kek_fkey" => {
@@ -363,7 +354,6 @@ impl OrgDeleteBlocker {
             }
             Self::Users
             | Self::Sandboxes
-            | Self::ArchivedSandboxes
             | Self::DeletedTemplates { .. }
             | Self::NodeGroups
             | Self::ManagesCluster => Ok(self),
@@ -374,7 +364,6 @@ impl OrgDeleteBlocker {
         match self {
             Self::Users => "org_has_users",
             Self::Sandboxes => "org_has_sandboxes",
-            Self::ArchivedSandboxes => "org_has_archived_sandboxes",
             Self::Templates => "org_has_templates",
             Self::DeletedTemplates { .. } => "org_has_retained_deleted_templates",
             Self::OrphanedSnapshotStorage => "org_has_orphaned_snapshot_storage",
@@ -391,9 +380,6 @@ impl OrgDeleteBlocker {
             Self::Sandboxes => "organization still has sandboxes, including deleted ones whose \
                                 records are kept for retention; delete them, or wait out \
                                 retention, before deleting the organization"
-                .to_string(),
-            Self::ArchivedSandboxes => "organization still has archived sandboxes; they must be \
-                                        purged before the organization can be deleted"
                 .to_string(),
             Self::Templates => "organization still owns templates; delete them before deleting \
                                 the organization"

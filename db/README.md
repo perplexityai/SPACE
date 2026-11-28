@@ -703,6 +703,10 @@ inside the multiline `CREDENTIAL_TABLES` declaration in
 `crates/l30_storage/db/migrate/src/bootstrap_roles.rs`; formatting-only changes and
 changes outside that list remain blocked. Removing an entry also requires a
 matching standalone `DROP TABLE` statement in a changed Postgres up migration.
+Before that PR, a code PR adds the table to `RETIRED_CREDENTIAL_TABLES` in the
+same file, which keeps it fenced whenever it exists without requiring it to:
+the provisioning Job's first bootstrap runs before the drop applies, and a
+rollback's down migration re-creates it.
 
 The same PR may also change entries inside `RO_COLUMN_DENYLIST`, because the
 bootstrap-role test requires every hash/bearer column to be fenced from

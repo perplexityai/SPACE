@@ -437,6 +437,17 @@ expect_guard_failure "${work_repo}" "migration-plus-shadowed-fence-test"
 grep -F "may not shadow or replace fence constants" \
   "${tmp_dir}/migration-plus-shadowed-fence-test.stderr" >/dev/null
 
+git -C "${work_repo}" checkout --quiet -B migration-plus-shadowed-retired-fence-test "${base_commit}"
+write_file "${work_repo}/db/postgres/20260623000032_add_credentials.up.sql" \
+  "CREATE TABLE new_credential_table (id BIGINT PRIMARY KEY);"
+rewrite_credential_tables "${work_repo}/${bootstrap_roles_path}" add new_credential_table
+append_file "${work_repo}/${postgres_bootstrap_test_path}" \
+  'const RETIRED_CREDENTIAL_TABLES: &[&str] = &[];'
+commit_scenario "${work_repo}" "migration plus shadowed retired fence test"
+expect_guard_failure "${work_repo}" "migration-plus-shadowed-retired-fence-test"
+grep -F "may not shadow or replace fence constants" \
+  "${tmp_dir}/migration-plus-shadowed-retired-fence-test.stderr" >/dev/null
+
 git -C "${work_repo}" checkout --quiet -B migration-plus-reordered-fence "${base_commit}"
 write_file "${work_repo}/db/postgres/20260623000015_add_credentials.up.sql" \
   "CREATE TABLE new_credential_table (id BIGINT PRIMARY KEY);"

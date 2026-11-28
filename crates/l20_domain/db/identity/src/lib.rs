@@ -18,9 +18,9 @@ pub enum DatabaseIdentity {
     /// Least-privilege application DML login for ordinary service queries.
     /// Holds no grants on the credential-fenced tables.
     SpaceUser,
-    /// Login reserved for narrowly scoped credential-table access
-    /// (`user_credentials`, `org_credentials`, `org_master_keys`,
-    /// `snapshot_storage_location_encrypted_fields`).
+    /// Login reserved for narrowly scoped credential-table access: the
+    /// tables `pplx-space-db-migrate`'s role bootstrap lists in
+    /// `CREDENTIAL_TABLES`, such as `org_master_keys`.
     SpaceCreds,
 }
 
