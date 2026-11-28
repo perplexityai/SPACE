@@ -178,9 +178,9 @@ pub(crate) enum RuntimeCampaignCommands {
         /// Failed items at which the campaign pauses itself: at least 1.
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
         failure_budget: u64,
-        /// For a sandbox campaign, also take running and paused sandboxes, as
-        /// the sandbox driver defines it. The server refuses it for
-        /// templates.
+        /// For a `sandboxes` campaign, also take running and paused sandboxes,
+        /// as the sandbox driver defines it. The server refuses it for
+        /// `templates` and `sandbox_force_restarts`.
         #[arg(long)]
         include_running: bool,
         /// Why, recorded with you on the campaign.
@@ -248,6 +248,8 @@ pub(crate) struct PhaseChange {
 pub(crate) enum RuntimeCampaignKindArg {
     Templates,
     Sandboxes,
+    #[value(name = "sandbox_force_restarts")]
+    SandboxForceRestarts,
 }
 
 impl RuntimeCampaignKindArg {
@@ -255,6 +257,7 @@ impl RuntimeCampaignKindArg {
         match self {
             Self::Templates => "templates",
             Self::Sandboxes => "sandboxes",
+            Self::SandboxForceRestarts => "sandbox_force_restarts",
         }
     }
 }

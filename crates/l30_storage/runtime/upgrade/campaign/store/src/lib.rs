@@ -7,9 +7,9 @@
 //! `runtime_upgrade` reconciler records the subjects a kind's driver finds
 //! ([`insert_pending`]), leases them under the campaign's pacing
 //! ([`lease_items`]), and records each outcome under its lease
-//! ([`finish_item`]). A sandbox campaign's driver finds its subjects with
-//! [`sandbox_candidates`] and re-reads one with [`subject_sandbox`]. The
-//! admin API starts ([`create_campaign`]), pauses ([`pause_campaign`]),
+//! ([`finish_item`]). Sandbox campaign drivers find their subjects with
+//! [`sandbox_candidates`] or [`force_restart_candidates`] and re-read one with
+//! [`subject_sandbox`]. The admin API starts ([`create_campaign`]), pauses ([`pause_campaign`]),
 //! resumes ([`resume_campaign`]), aborts ([`abort_campaign`]) and reads
 //! ([`get_record`], [`list_records`]) campaigns.
 //!
@@ -104,15 +104,25 @@ pub use create::{
     CreateCampaignError, NewCampaign, REASON_MAX_CHARS, check_reason, create_campaign, validate,
 };
 pub use items::{
-    ItemOutcome, LeaseError, LeasedItem, RETIRED_ATTEMPTS, RedriveReport, finish_item,
-    insert_pending, lease_items, redrive_expired, release_lapsed_in_finished, renew_lease,
-    retire_skipped,
+    ItemOutcome, LeaseError, LeasedItem, RETIRED_ATTEMPTS, RedriveReport,
+    clear_leased_starting_on_target, clear_starting_on_target, continuing_run, finish_item,
+    insert_pending, lease_items, lease_items_after, lease_selected_items,
+    mark_leased_started_on_target, mark_leased_starting_on_target, mark_run_started,
+    mark_started_on_target, mark_starting_on_target, redrive_expired, release_lapsed_in_finished,
+    renew_lease, retire_skipped, started_on_target, starting_on_target,
 };
 pub use phase::{complete_if_drained, pause_if_over_budget};
 pub use pplx_space_rollout_queue::{MAX_LEASE, clamp_lease};
-pub use sandboxes::{SandboxCandidate, SubjectSandbox, sandbox_candidates, subject_sandbox};
+pub use sandboxes::{
+    ExternalOperation, ForceRestartCandidate, SandboxCandidate, StartedPendingTargetPage,
+    StartedPendingTargetSandbox, StoppedExecutionOwnership, SubjectSandbox,
+    external_activation_since, external_stop_since, force_restart_candidates, sandbox_candidates,
+    started_pending_target_sandboxes, stopped_execution_ownership, subject_sandbox,
+};
 pub use twin_readers::{HOLDING_SAMPLE, TwinReaders, workers_not_reading_twins};
 
+#[cfg(test)]
+mod plan_tests;
 #[cfg(test)]
 mod tests;
 
@@ -231,6 +241,7 @@ closed_vocabulary!(
     CampaignKind, "campaign kind" {
         Templates => "templates",
         Sandboxes => "sandboxes",
+        SandboxForceRestarts => "sandbox_force_restarts",
     }
 );
 
@@ -317,7 +328,7 @@ impl CampaignKind {
     pub const fn subject_kind(self) -> SubjectKind {
         match self {
             Self::Templates => SubjectKind::TemplateRelease,
-            Self::Sandboxes => SubjectKind::Sandbox,
+            Self::Sandboxes | Self::SandboxForceRestarts => SubjectKind::Sandbox,
         }
     }
 }
@@ -336,8 +347,8 @@ pub struct Campaign {
     pub max_in_flight_per_cluster: u64,
     /// Failed items at which the campaign pauses itself; at least 1.
     pub failure_budget: u64,
-    /// Whether a sandbox campaign also takes running and paused sandboxes.
-    /// The sandbox driver gives it its meaning; other kinds ignore it.
+    /// Whether a `sandboxes` campaign also takes running and paused sandboxes.
+    /// The `sandboxes` driver gives it its meaning; other kinds ignore it.
     pub include_running: bool,
     /// Raised by exactly one with every change to the campaign row.
     pub generation: u64,

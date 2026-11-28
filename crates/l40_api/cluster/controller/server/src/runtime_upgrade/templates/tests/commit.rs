@@ -232,7 +232,7 @@ async fn a_worker_that_doesnt_read_twins_at_commit_releases_the_item() -> TestRe
         inner: Arc::clone(&fixture.objects),
         pool: fixture.pool().clone(),
         template: "seed",
-        on_write: OnWrite::AddWorkerThatDoesntReadTwins,
+        on_write: OnWrite::AddWorkerThatDoesntReadTwins(std::sync::atomic::AtomicBool::new(false)),
     }));
     fixture.tick(&reconciler).await;
 
@@ -254,6 +254,75 @@ async fn a_worker_that_doesnt_read_twins_at_commit_releases_the_item() -> TestRe
     assert!(
         error.contains("don't report reading twin metadata at the twin's commit"),
         "{error}"
+    );
+
+    // In `canary`, if a derived build commits its base's twin first and then
+    // releases at its own commit (`AddWorkerThatDoesntReadTwins` on `"child"`),
+    // `mark_run_started` keeps `child` pinned as the single active canary
+    // subject once the worker reports reading twins, without rotating to an
+    // untouched sibling release first.
+    let Some(canary_fixture) = Fixture::new().await? else {
+        return Ok(());
+    };
+    canary_fixture.template("child").await?;
+    canary_fixture.template("base").await?;
+    canary_fixture.template("sibling").await?;
+    let base_hash = format!("sha256:{}", "01".repeat(32));
+    let (child, child_hash) = canary_fixture
+        .release("child", 2, Some(("base", &base_hash)))
+        .await?;
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let (base_id, made_base_hash) = canary_fixture.release("base", 1, None).await?;
+    assert_eq!(made_base_hash, base_hash);
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let (sibling, sibling_hash) = canary_fixture.release("sibling", 3, None).await?;
+    assert!(
+        child < base_id && base_id < sibling,
+        "child ({child}) must sort first on tick 1 so the saved canary cursor rotates toward sibling ({sibling}) unless mark_run_started pins child"
+    );
+    canary_fixture.set_default(canary_fixture.e1).await?;
+    let canary_campaign = canary_fixture.campaign(CampaignPhase::Canary, 1).await?;
+    let canary_reconciler = canary_fixture.reconciler_with(Arc::new(HookedObjects {
+        inner: Arc::clone(&canary_fixture.objects),
+        pool: canary_fixture.pool().clone(),
+        template: "child",
+        on_write: OnWrite::AddWorkerThatDoesntReadTwins(std::sync::atomic::AtomicBool::new(false)),
+    }));
+    canary_fixture.tick(&canary_reconciler).await;
+    assert!(
+        canary_fixture.twin("base", &base_hash).await?.is_some(),
+        "base twin committed before child's commit released"
+    );
+    assert_eq!(canary_fixture.twin("child", &child_hash).await?, None);
+    assert_eq!(canary_fixture.twin("sibling", &sibling_hash).await?, None);
+
+    // Remove the unready extra worker and reuse `canary_reconciler` (preserving
+    // its lease cursor past `child`): `mark_run_started` must keep `child`
+    // pinned as the active canary item and complete `Done` while `sibling`
+    // stays untouched in `canary`.
+    sqlx::query(
+        "DELETE FROM nodes n
+         WHERE NOT EXISTS (
+             SELECT 1 FROM node_status_snapshots s WHERE s.node_id = n.id
+         )",
+    )
+    .execute(canary_fixture.pool())
+    .await?;
+    canary_fixture.tick(&canary_reconciler).await;
+    let (child_phase, child_attempts): (String, i64) = sqlx::query_as(
+        "SELECT phase, attempts FROM runtime_upgrade_items
+         WHERE campaign_id = $1 AND subject_id = $2",
+    )
+    .bind(canary_campaign)
+    .bind(child)
+    .fetch_one(canary_fixture.pool())
+    .await?;
+    assert_eq!((child_phase.as_str(), child_attempts), ("done", 1));
+    assert!(canary_fixture.twin("child", &child_hash).await?.is_some());
+    assert_eq!(
+        canary_fixture.twin("sibling", &sibling_hash).await?,
+        None,
+        "canary must finish the partially started derived build without moving sibling"
     );
     Ok(())
 }

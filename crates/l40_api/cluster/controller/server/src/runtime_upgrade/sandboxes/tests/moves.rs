@@ -331,6 +331,103 @@ async fn a_running_sandbox_is_stopped_only_while_it_and_the_policy_still_call_fo
             "{state}"
         );
     }
+
+    // A temporary campaign hold (`Allowed` or missing catalog edge) between
+    // leasing a running item on its final attempt and `may_stop` releases
+    // without burning the attempt, so restoring `Blocked` + edge still moves it.
+    let Some(db) = test_db().await? else {
+        return Ok(());
+    };
+    seed_policy(&db.pool, RuntimeEnvironmentState::Blocked, true).await?;
+    let campaign = insert_campaign(
+        &db.pool,
+        CampaignSeed {
+            include_running: true,
+            ..seed()
+        },
+    )
+    .await?;
+    let node = node(&db.pool).await?;
+    let sandbox = insert_sandbox(
+        &db.pool,
+        K8S,
+        SandboxLifecycle::Started,
+        node,
+        Published::Bound(source()),
+    )
+    .await?;
+    record(&db.pool, campaign, &[sandbox]).await?;
+    sqlx::query(sql!(
+        "UPDATE runtime_upgrade_items
+         SET attempts = $3
+         WHERE campaign_id = $1 AND subject_id = $2"
+    ))
+    .bind(campaign)
+    .bind(sandbox)
+    .bind(i64::try_from(super::super::super::MAX_ATTEMPTS - 1)?)
+    .execute(&db.pool)
+    .await?;
+    let leased = store::lease_items(&db.pool, campaign, std::time::Duration::from_secs(30), 1)
+        .await?
+        .pop()
+        .expect("leased final attempt");
+    let mut tx = db.pool.begin().await?;
+    pplx_space_runtime_environment_policy_store::set_environment_state(
+        &mut *tx,
+        source(),
+        RuntimeEnvironmentState::Allowed,
+        &change(),
+    )
+    .await?;
+    tx.commit().await?;
+    let campaign_row = store::list_unfinished(&db.pool)
+        .await?
+        .into_iter()
+        .find(|row| row.id == campaign)
+        .expect("campaign");
+    let dispatcher = FakeDispatcher::default().persisting(db.pool.clone());
+    let driver = SandboxDriver::new(db.pool.clone(), K8S, dispatcher.clone());
+    let outcome = driver.upgrade(&campaign_row, &leased).await;
+    assert!(
+        dispatcher.calls().is_empty(),
+        "releasing while source is re-allowed must not dispatch onto the sandbox"
+    );
+    assert_eq!(
+        outcome,
+        super::super::super::ItemOutcome::Release(
+            pplx_space_runtime_upgrade_campaign_store::ItemError::new(
+                POLICY_STOPPED_MOVING_RUNNING
+            )
+        )
+    );
+    assert!(store::finish_item(&db.pool, &leased, &outcome).await?);
+    assert_eq!(
+        item(&db.pool, campaign, sandbox).await?,
+        (
+            "pending".to_owned(),
+            Some(POLICY_STOPPED_MOVING_RUNNING.to_owned()),
+            i64::try_from(super::super::super::MAX_ATTEMPTS - 1)?
+        )
+    );
+    let mut tx = db.pool.begin().await?;
+    pplx_space_runtime_environment_policy_store::set_environment_state(
+        &mut *tx,
+        source(),
+        RuntimeEnvironmentState::Blocked,
+        &change(),
+    )
+    .await?;
+    tx.commit().await?;
+    let reconciler = reconciler(&db.pool, dispatcher);
+    tick(&reconciler).await;
+    assert_eq!(
+        item(&db.pool, campaign, sandbox).await?,
+        (
+            "done".to_owned(),
+            None,
+            i64::try_from(super::super::super::MAX_ATTEMPTS)?
+        )
+    );
     Ok(())
 }
 
@@ -427,17 +524,29 @@ async fn a_publish_without_an_execution_is_attributed_nowhere() -> TestResult {
         return Ok(());
     };
     // The source carries the initial Firecracker versions, which the legacy
-    // setting would match an empty record to.
+    // rule attributes unbound executions to. Keep `canary` phase with one
+    // completed canary item so settled scans with zero new subjects wait for
+    // `:resume` instead of completing the campaign before both
+    // `legacy_unbound_allowed` settings and post-lease `upgrade` run.
     seed_policy(&db.pool, RuntimeEnvironmentState::Deprecated, true).await?;
-    let mut tx = db.pool.begin().await?;
-    pplx_space_runtime_environment_policy_store::set_legacy_unbound_allowed(
-        &mut *tx,
-        false,
-        &change(),
+    let campaign = insert_campaign(
+        &db.pool,
+        CampaignSeed {
+            phase: CampaignPhase::Canary,
+            ..seed()
+        },
     )
     .await?;
-    tx.commit().await?;
-    let campaign = insert_campaign(&db.pool, seed()).await?;
+    sqlx::query(sql!(
+        "INSERT INTO runtime_upgrade_items (
+             campaign_id, subject_kind, subject_id, phase, attempts
+         )
+         VALUES ($1, 'sandbox', $2, 'done', 1)"
+    ))
+    .bind(campaign)
+    .bind(Uuid::now_v7())
+    .execute(&db.pool)
+    .await?;
     let node = node(&db.pool).await?;
     let empty = insert_sandbox(
         &db.pool,
@@ -447,11 +556,50 @@ async fn a_publish_without_an_execution_is_attributed_nowhere() -> TestResult {
         Published::Nothing,
     )
     .await?;
-    // Recorded anyway, as if found before its publish lost the execution.
-    record(&db.pool, campaign, &[empty]).await?;
     let dispatcher = FakeDispatcher::default();
     let reconciler = reconciler(&db.pool, dispatcher.clone());
 
+    let allowed_scan = tick(&reconciler).await;
+    assert_eq!(
+        (
+            allowed_scan.inserted,
+            allowed_scan.leased,
+            allowed_scan.completed.is_empty(),
+        ),
+        (0, 0, true),
+        "discovery skips an empty publish when legacy_unbound_allowed is true"
+    );
+
+    let mut tx = db.pool.begin().await?;
+    pplx_space_runtime_environment_policy_store::set_legacy_unbound_allowed(
+        &mut *tx,
+        false,
+        &change(),
+    )
+    .await?;
+    tx.commit().await?;
+
+    let disallowed_scan = tick(&reconciler).await;
+    assert_eq!(
+        (
+            disallowed_scan.inserted,
+            disallowed_scan.leased,
+            disallowed_scan.completed.is_empty(),
+        ),
+        (0, 0, true),
+        "discovery skips an empty publish when legacy_unbound_allowed is false"
+    );
+
+    // Resume into `rolling` and record `empty` as if found before its publish
+    // lost the execution.
+    store::resume_campaign(
+        &pplx_space_postgres_pool::Db::from(db.pool.clone()),
+        campaign,
+        &store::PhaseChange::default(),
+        false,
+    )
+    .await?;
+    record(&db.pool, campaign, &[empty]).await?;
     let report = tick(&reconciler).await;
 
     assert_eq!(

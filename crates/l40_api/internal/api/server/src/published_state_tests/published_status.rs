@@ -496,3 +496,86 @@ async fn suspended_projection_reads_every_ascii_spelling_of_suspended() -> TestR
     assert!(mismatches.is_empty(), "{mismatches:#?}");
     Ok(())
 }
+
+/// `release_completed_activations`: completing a `started` or `paused`
+/// activation clears a stopped `disk` artifact pin so the cluster row matches
+/// the node's cold-boot clear (`action_stamp::stamp_started_after_start`),
+/// while preserving `full` suspend pins and `created` materializations.
+#[tokio::test(flavor = "current_thread")]
+async fn activation_completion_clears_disk_artifact_pin_on_started_or_paused_and_keeps_full_pin()
+-> TestResult {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let node_id = ready_node(pool).await?;
+
+    for (initial_lifecycle, target, kind, origin, should_clear) in [
+        ("stopped", "started", "disk", "stop", true),
+        ("stopped", "paused", "disk", "stop", true),
+        ("restoring", "started", "full", "suspend", false),
+        ("created", "created", "disk", "stop", false),
+    ] {
+        let sandbox_id = insert_running(pool, node_id, initial_lifecycle).await?;
+        let artifact_id = Uuid::now_v7();
+        sqlx::query(sql!(
+            "UPDATE sandboxes
+                SET current_local_artifact_id = $2,
+                    current_local_artifact_kind = $3,
+                    current_local_artifact_origin = $4
+              WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .bind(artifact_id)
+        .bind(kind)
+        .bind(origin)
+        .execute(pool)
+        .await?;
+
+        let attempt = Uuid::now_v7();
+        set_activation_attempt(pool, sandbox_id, attempt, target).await?;
+        let report = with_receipt(
+            published_sandbox_state(sandbox_id, target),
+            "activation_completed",
+            target,
+            attempt,
+            "",
+        );
+        publish(pool, node_id, report).await?;
+
+        let (actual_lifecycle, pin_id, pin_kind, pin_origin): (
+            String,
+            Option<Uuid>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(sql!(
+            "SELECT lifecycle,
+                    current_local_artifact_id,
+                    current_local_artifact_kind,
+                    current_local_artifact_origin
+               FROM sandboxes
+              WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(actual_lifecycle, target);
+        assert_eq!(
+            activation_attempt(pool, sandbox_id).await?,
+            None,
+            "target {target} must release activation attempt"
+        );
+        if should_clear {
+            assert_eq!(
+                (pin_id, pin_kind, pin_origin),
+                (None, None, None),
+                "target {target} from {initial_lifecycle} must clear disk pin"
+            );
+        } else {
+            assert_eq!(
+                (pin_id, pin_kind.as_deref(), pin_origin.as_deref()),
+                (Some(artifact_id), Some(kind), Some(origin)),
+                "target {target} with {kind}/{origin} pin must keep pin"
+            );
+        }
+    }
+    Ok(())
+}

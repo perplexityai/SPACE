@@ -53,8 +53,8 @@ use crate::models::User;
 use crate::routes::AppState;
 
 /// Campaign kinds a cluster-controller driver moves, so the API starts
-/// campaigns of them: templates. The sandbox driver adds its kind here as it
-/// lands, with the controller's `runtime_upgrade::Drivers` registration. A
+/// campaigns of them: templates. The sandbox drivers add their kinds here as
+/// they land, with the controller's `runtime_upgrade::Drivers` registration. A
 /// campaign of a kind without a driver would sit in canary forever.
 pub const RUNTIME_UPGRADE_DRIVEN_KINDS: &[CampaignKind] = &[CampaignKind::Templates];
 
@@ -205,8 +205,12 @@ fn edge_to_check(
     counts: &ItemCounts,
 ) -> Option<(EnvironmentReference, EnvironmentReference)> {
     let campaign = &record.campaign;
-    (campaign.kind == CampaignKind::Sandboxes && counts.pending > 0 && !campaign.phase.finished())
-        .then_some((campaign.from, campaign.to))
+    (matches!(
+        campaign.kind,
+        CampaignKind::Sandboxes | CampaignKind::SandboxForceRestarts
+    ) && counts.pending > 0
+        && !campaign.phase.finished())
+    .then_some((campaign.from, campaign.to))
 }
 
 /// Read whether the catalog certifies each campaign's edge, in one query:
@@ -256,9 +260,11 @@ fn campaign_response(
     };
     let stranded = match (campaign.kind, edge_certified) {
         (CampaignKind::Templates, _) => None,
-        (CampaignKind::Sandboxes, Some(false)) => Some(counts.pending),
+        (CampaignKind::Sandboxes | CampaignKind::SandboxForceRestarts, Some(false)) => {
+            Some(counts.pending)
+        }
         // Certified, or nothing pending, or finished: nothing stranded.
-        (CampaignKind::Sandboxes, _) => Some(0),
+        (CampaignKind::Sandboxes | CampaignKind::SandboxForceRestarts, _) => Some(0),
     };
     CampaignResponse {
         id: campaign.id.0,

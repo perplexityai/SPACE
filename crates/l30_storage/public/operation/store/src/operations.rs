@@ -24,6 +24,13 @@ use sqlx::{FromRow, types::Json};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+mod gc;
+
+pub use gc::{
+    DeletedOperations, delete_by_ids, delete_by_ids_with_idempotency, due_for_gc,
+    scrub_finished_payload_path, share_lock_campaign_retention,
+};
+
 /// The columns every whole-operation read selects, in [`PublicOperationRow`]'s
 /// shape. Named rather than `*`: adding or dropping a `public_operations`
 /// column changes what `SELECT *` returns, and every pooled connection that
@@ -733,21 +740,6 @@ pub async fn joinable_on_sandbox(
         operation_id,
         system,
     }))
-}
-
-/// Delete the operations `operation_ids`, returning the ids deleted.
-pub async fn delete_by_ids(
-    executor: impl Executor<'_>,
-    operation_ids: &[Uuid],
-) -> Result<Vec<Uuid>, DbError> {
-    Ok(sqlx::query_scalar::<_, Uuid>(sql!(
-        "DELETE FROM public_operations
-         WHERE operation_id = ANY($1::UUID[])
-         RETURNING operation_id"
-    ))
-    .bind(operation_ids)
-    .fetch_all(executor.into_sqlx())
-    .await?)
 }
 
 /// A new queued operation, as [`insert`] records it.
@@ -1540,65 +1532,6 @@ pub async fn requeue_claimed(
     .fetch_optional(executor.into_sqlx())
     .await?;
     Ok(updated.is_some())
-}
-
-/// Remove the payload's `json_path` from up to `limit` finished `kind`
-/// operations that still carry it, least recently updated first, skipping
-/// any another transaction holds. Returns how many were scrubbed.
-pub async fn scrub_finished_payload_path(
-    executor: impl Executor<'_>,
-    kind: OperationKind,
-    json_path: &[&str],
-    limit: i64,
-) -> Result<u64, DbError> {
-    let scrubbed = sqlx::query(sql!(
-        "WITH terminal_operations AS (
-             SELECT operation_id
-             FROM public_operations
-             WHERE kind = $2
-               AND state IN ($3, $4, $5, $6)
-               AND payload_json #> $7::text[] IS NOT NULL
-             ORDER BY updated_at ASC, operation_id ASC
-             LIMIT $1
-             FOR UPDATE SKIP LOCKED
-         )
-         UPDATE public_operations AS operation
-         SET payload_json = operation.payload_json #- $7::text[],
-             updated_at = NOW()
-         FROM terminal_operations
-         WHERE operation.operation_id = terminal_operations.operation_id"
-    ))
-    .bind(limit)
-    .bind(kind.as_str())
-    .bind(OperationState::Succeeded.as_str())
-    .bind(OperationState::Failed.as_str())
-    .bind(OperationState::Canceled.as_str())
-    .bind(OperationState::Expired.as_str())
-    .bind(json_path)
-    .execute(executor.into_sqlx())
-    .await?
-    .rows_affected();
-    Ok(scrubbed)
-}
-
-/// Up to `limit` finished operations past their `gc_after` by the database
-/// clock, earliest first.
-pub async fn due_for_gc(executor: impl Executor<'_>, limit: i64) -> Result<Vec<Uuid>, DbError> {
-    Ok(sqlx::query_scalar::<_, Uuid>(sql!(
-        "SELECT operation_id
-         FROM public_operations
-         WHERE state IN ($2, $3, $4, $5)
-           AND gc_after <= NOW()
-         ORDER BY gc_after ASC, operation_id ASC
-         LIMIT $1"
-    ))
-    .bind(limit)
-    .bind(OperationState::Succeeded.as_str())
-    .bind(OperationState::Failed.as_str())
-    .bind(OperationState::Canceled.as_str())
-    .bind(OperationState::Expired.as_str())
-    .fetch_all(executor.into_sqlx())
-    .await?)
 }
 
 /// Take the transaction-level advisory lock on `key`, hashed, waiting for

@@ -35,7 +35,7 @@ use pplx_space_cpu_arch::Arch;
 use pplx_space_execution_catalog::catalog::{CompiledEnvironment, template_cache_partition};
 use pplx_space_execution_spec::{EnvironmentReference, ExecutionMetadata};
 use pplx_space_runtime_upgrade_campaign_store::{
-    Campaign, CampaignKind, ItemError, ItemOutcome, LeasedItem,
+    Campaign, CampaignKind, ItemError, ItemOutcome, LeasedItem, mark_run_started,
 };
 use pplx_space_template_release_store::{
     self as releases, InsertTwin, PartitionSelector, ReleaseObjects, ReleaseSubject,
@@ -44,7 +44,7 @@ use pplx_space_template_release_store::{
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use super::{CampaignDriver, Plan, ScanPlan, SubjectPage, TemplateStorageOrigins};
+use super::{CampaignDriver, Plan, ScanPlan, SubjectPage, SubjectScan, TemplateStorageOrigins};
 
 mod metadata;
 
@@ -284,21 +284,24 @@ impl CampaignDriver for TemplateDriver {
         _plan: ScanPlan,
         after: Option<Uuid>,
         limit: u32,
-    ) -> Result<SubjectPage, String> {
+    ) -> Result<SubjectScan, String> {
         let on_source =
             releases::source_releases_page(&self.pool, partition_of(campaign.from), after, limit)
                 .await
                 .map_err(|error| format!("listing the source's releases: {error}"))?;
-        Ok(SubjectPage {
+        Ok(SubjectScan::Page(SubjectPage {
             last: on_source.last().copied(),
             examined: on_source.len(),
             on_source,
             elsewhere: Vec::new(),
-        })
+        }))
     }
 
     async fn upgrade(&self, campaign: &Campaign, item: &LeasedItem) -> ItemOutcome {
-        match self.move_release(campaign, item.subject_id).await {
+        match self
+            .move_release_with_lease(campaign, item.subject_id, Some(item))
+            .await
+        {
             Ok(Moved::Done) => ItemOutcome::Done,
             Ok(Moved::Skipped(reason)) => ItemOutcome::Skipped(ItemError::new(reason)),
             Err(MoveError::Retry(reason)) => ItemOutcome::Retry(ItemError::new(reason)),
@@ -336,10 +339,21 @@ impl TemplateDriver {
     /// and the lease order can't put the base's item first. A canary's one
     /// item therefore moves its build's lineage up to the first base that
     /// already has a twin, and the bases' own items then end done.
+    #[cfg(test)]
     async fn move_release(
         &self,
         campaign: &Campaign,
         release_id: Uuid,
+    ) -> Result<Moved, MoveError> {
+        self.move_release_with_lease(campaign, release_id, None)
+            .await
+    }
+
+    async fn move_release_with_lease(
+        &self,
+        campaign: &Campaign,
+        release_id: Uuid,
+        leased_item: Option<&LeasedItem>,
     ) -> Result<Moved, MoveError> {
         // The prepared levels, `release_id`'s first, and the base references
         // between them: `bases[..k]` led from `release_id` to level `k`, so
@@ -408,14 +422,31 @@ impl TemplateDriver {
             // builds above it mustn't commit theirs: retry, and the next
             // lease resolves the base again (a base gone from the source
             // has nothing to order, so its derived builds then go ahead).
-            if depth > 0
-                && let Moved::Skipped(reason) = &moved
-            {
-                return Err(through_bases(
-                    MoveError::Retry(format!("the base was skipped: {reason}")),
-                    &bases,
-                    depth,
-                ));
+            if depth > 0 {
+                if let Moved::Skipped(reason) = &moved {
+                    return Err(through_bases(
+                        MoveError::Retry(format!("the base was skipped: {reason}")),
+                        &bases,
+                        depth,
+                    ));
+                }
+                if let Some(item) = leased_item {
+                    match mark_run_started(&self.pool, item).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Err(MoveError::Released(
+                                "the item lease is no longer active".to_owned(),
+                            ));
+                        }
+                        Err(error) => {
+                            return Err(through_bases(
+                                MoveError::database("recording base twin progress", error),
+                                &bases,
+                                depth,
+                            ));
+                        }
+                    }
+                }
             }
         }
         Ok(moved)

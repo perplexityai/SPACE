@@ -4,9 +4,6 @@
 //! driver decides: which sandboxes are on the source, which lifecycles count,
 //! and what each item's upgrade does.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
-
 use pplx_space_accounts::NodeId;
 use pplx_space_content_digest::Digest;
 use pplx_space_db_test_fixtures::{
@@ -27,8 +24,17 @@ use sqlx::PgPool;
 use super::super::{Drivers, Reconciler, ReconcilerConfig, TickReport};
 use super::*;
 
+mod fakes;
+mod force_restart_drain_fences;
+mod force_restart_edge_fences;
+mod force_restart_fences;
+mod force_restart_recovery;
+mod force_restart_start_recovery;
+mod force_restarts;
 mod moves;
 mod passes;
+
+use fakes::*;
 
 fn environment(byte: u8) -> EnvironmentReference {
     EnvironmentReference::new(Digest::sha256([byte; 32]))
@@ -50,11 +56,24 @@ async fn test_db() -> TestResult<Option<TestDb>> {
     try_pg_test_db_with_max_connections(8).await
 }
 
+fn db_handle(pool: &PgPool) -> pplx_space_postgres_pool::Db {
+    pplx_space_postgres_pool::Db::from(pool.clone())
+}
+
 fn change() -> PolicyChange {
     PolicyChange {
         actor: None,
         reason: PolicyChangeReason::new("runtime upgrade test").expect("valid reason"),
     }
+}
+
+fn to_jiff(value: time::OffsetDateTime) -> jiff::Timestamp {
+    jiff::Timestamp::from_nanosecond(value.unix_timestamp_nanos()).expect("valid test timestamp")
+}
+
+fn to_offset_date_time(value: jiff::Timestamp) -> time::OffsetDateTime {
+    time::OffsetDateTime::from_unix_timestamp_nanos(value.as_nanosecond())
+        .expect("valid sqlx timestamp")
 }
 
 /// The catalog and policy a campaign off `source()` runs under: both
@@ -129,6 +148,9 @@ enum Published {
         kernel: &'static str,
         state_format_version: &'static str,
     },
+    /// Unbound from before execution metadata: kernel component only, with no
+    /// runtime or state-format version.
+    PreMetadata { kernel: &'static str },
     /// A publish that carried no execution.
     Nothing,
 }
@@ -144,17 +166,32 @@ async fn insert_sandbox(
     sqlx::query(sql!(
         "INSERT INTO sandboxes (
              id, user_id, org_id, managed_by, lifecycle, placement,
-             network_policy_generation
+             active_node_id, network_policy_generation
          )
-         VALUES ($1, $2, $3, $4, $5, 'on_node', 1)"
+         VALUES ($1, $2, $3, $4, $5, 'on_node', $6, 1)"
     ))
     .bind(sandbox_id)
     .bind(SEED_USER_ID)
     .bind(SEED_ORG_ID)
     .bind(managed_by)
     .bind(lifecycle.as_str())
+    .bind(node)
     .execute(pool)
     .await?;
+    if managed_by == K8S {
+        sqlx::query(sql!(
+            "INSERT INTO sandbox_k8s_executions (
+                 sandbox_id, generation, pod_name, pod_namespace, pod_uid,
+                 pod_ip, state, active
+             )
+             VALUES ($1, 1, $2, 'space', $3, '10.0.0.10'::inet, 'running', TRUE)"
+        ))
+        .bind(sandbox_id)
+        .bind(format!("sbx-{sandbox_id}"))
+        .bind(format!("pod-{sandbox_id}"))
+        .execute(pool)
+        .await?;
+    }
     let (metadata, runtime_version, state_format_version) = match published {
         Published::Bound(environment) => (
             Some(serde_json::json!({ "environment": environment.to_string() })),
@@ -169,6 +206,11 @@ async fn insert_sandbox(
             Some(serde_json::json!({ "components": [{ "kind": "kernel", "version": kernel }] })),
             Some(runtime_version),
             Some(state_format_version),
+        ),
+        Published::PreMetadata { kernel } => (
+            Some(serde_json::json!({ "components": [{ "kind": "kernel", "version": kernel }] })),
+            None,
+            None,
         ),
         Published::Nothing => (None, None, None),
     };
@@ -297,99 +339,19 @@ async fn set_lifecycle(pool: &PgPool, sandbox: Uuid, lifecycle: &str) -> TestRes
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum Call {
-    Stop(Uuid),
-    Upgrade(Uuid),
-}
-
-#[derive(Default)]
-struct FakeState {
-    calls: Vec<Call>,
-    /// The source each upgrade was guarded on and the target it was asked
-    /// for, in call order.
-    upgrades: Vec<(EnvironmentReference, EnvironmentReference)>,
-    /// The source each stop was guarded on and the target it was for, in
-    /// call order.
-    stops: Vec<(EnvironmentReference, EnvironmentReference)>,
-    /// What a stop returns per sandbox; `Stopped` otherwise.
-    stop_script: HashMap<Uuid, GuardedStop>,
-    /// Results to return per sandbox, in order; `Upgraded` once exhausted.
-    script: HashMap<Uuid, VecDeque<Result<StoppedUpgrade, DispatchError>>>,
-    /// The result for every sandbox without a script.
-    default: Option<Result<StoppedUpgrade, DispatchError>>,
-}
-
-/// Records every call and answers from a script.
-#[derive(Clone, Default)]
-struct FakeDispatcher {
-    state: Arc<Mutex<FakeState>>,
-}
-
-impl FakeDispatcher {
-    fn state(&self) -> std::sync::MutexGuard<'_, FakeState> {
-        self.state.lock().unwrap()
-    }
-
-    fn answer_all(&self, result: Result<StoppedUpgrade, DispatchError>) {
-        self.state().default = Some(result);
-    }
-
-    fn script(&self, sandbox: Uuid, results: Vec<Result<StoppedUpgrade, DispatchError>>) {
-        self.state().script.insert(sandbox, results.into());
-    }
-
-    fn calls(&self) -> Vec<Call> {
-        self.state().calls.clone()
-    }
-
-    /// The sandboxes upgrades were asked for, sorted, repeats included.
-    fn upgraded(&self) -> Vec<Uuid> {
-        let mut upgraded: Vec<Uuid> = self
-            .calls()
-            .into_iter()
-            .filter_map(|call| match call {
-                Call::Upgrade(sandbox) => Some(sandbox),
-                Call::Stop(_) => None,
-            })
-            .collect();
-        upgraded.sort();
-        upgraded
-    }
-}
-
-impl SandboxUpgradeDispatcher for FakeDispatcher {
-    async fn upgrade_stopped(
-        &self,
-        sandbox_id: SandboxId,
-        source: EnvironmentReference,
-        target: EnvironmentReference,
-    ) -> Result<StoppedUpgrade, DispatchError> {
-        let sandbox = sandbox_id.as_uuid();
-        let mut state = self.state();
-        state.calls.push(Call::Upgrade(sandbox));
-        state.upgrades.push((source, target));
-        let scripted = state.script.get_mut(&sandbox).and_then(VecDeque::pop_front);
-        scripted
-            .or_else(|| state.default.clone())
-            .unwrap_or(Ok(StoppedUpgrade::Upgraded))
-    }
-
-    async fn stop(
-        &self,
-        sandbox_id: SandboxId,
-        source: EnvironmentReference,
-        target: EnvironmentReference,
-    ) -> Result<GuardedStop, DispatchError> {
-        let sandbox = sandbox_id.as_uuid();
-        let mut state = self.state();
-        state.calls.push(Call::Stop(sandbox));
-        state.stops.push((source, target));
-        Ok(state
-            .stop_script
-            .remove(&sandbox)
-            .unwrap_or(GuardedStop::Stopped))
-    }
+async fn set_bound(pool: &PgPool, sandbox: Uuid, environment: EnvironmentReference) -> TestResult {
+    sqlx::query(sql!(
+        "UPDATE sandbox_observed_states
+         SET execution_metadata = $2,
+             runtime_version = NULL,
+             state_format_version = NULL
+         WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox)
+    .bind(serde_json::json!({ "environment": environment.to_string() }))
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// A reconciler that runs only the sandbox driver over `dispatcher`,
@@ -397,7 +359,7 @@ impl SandboxUpgradeDispatcher for FakeDispatcher {
 fn paging(pool: &PgPool, dispatcher: FakeDispatcher, page: u32) -> Reconciler {
     Reconciler::new(
         pool.clone(),
-        Drivers::default().with(SandboxDriver::new(pool.clone(), K8S.as_str(), dispatcher)),
+        Drivers::default().with(SandboxDriver::new(pool.clone(), K8S, dispatcher)),
         ReconcilerConfig {
             enabled: true,
             candidate_page: page,
@@ -408,6 +370,57 @@ fn paging(pool: &PgPool, dispatcher: FakeDispatcher, page: u32) -> Reconciler {
 
 fn reconciler(pool: &PgPool, dispatcher: FakeDispatcher) -> Reconciler {
     paging(pool, dispatcher, ReconcilerConfig::default().candidate_page)
+}
+
+fn force_restart_paging(
+    pool: &PgPool,
+    dispatcher: FakeDispatcher,
+    memory_retirement: FakeMemoryRetirement,
+    page: u32,
+) -> Reconciler {
+    let dispatcher = dispatcher.with_memory_retirement(memory_retirement.clone());
+    Reconciler::new(
+        pool.clone(),
+        Drivers::default().with(SandboxForceRestartDriver::new(
+            pool.clone(),
+            K8S,
+            dispatcher,
+            memory_retirement,
+        )),
+        ReconcilerConfig {
+            enabled: true,
+            candidate_page: page,
+            ..ReconcilerConfig::default()
+        },
+    )
+}
+
+fn force_restart_reconciler(
+    pool: &PgPool,
+    dispatcher: FakeDispatcher,
+    memory_retirement: FakeMemoryRetirement,
+) -> Reconciler {
+    force_restart_paging(
+        pool,
+        dispatcher,
+        memory_retirement,
+        ReconcilerConfig::default().candidate_page,
+    )
+}
+
+fn force_restart_seed() -> CampaignSeed {
+    CampaignSeed {
+        kind: CampaignKind::SandboxForceRestarts,
+        ..seed()
+    }
+}
+
+async fn resident_on_source(
+    pool: &PgPool,
+    lifecycle: SandboxLifecycle,
+    node: NodeId,
+) -> TestResult<Uuid> {
+    insert_sandbox(pool, K8S, lifecycle, node, Published::Bound(source())).await
 }
 
 /// One tick, and every dispatch it started.
@@ -431,4 +444,29 @@ async fn tick_until_finished(
         }
     }
     Ok(limit)
+}
+
+/// Tick at most `limit` times until `campaign` records at least one `done` item.
+async fn tick_until_canary_done(
+    reconciler: &Reconciler,
+    pool: &PgPool,
+    campaign: CampaignId,
+    limit: usize,
+) -> TestResult {
+    for _ in 0..limit {
+        let current = counts(pool, campaign).await?;
+        if current.done > 0 {
+            return Ok(());
+        }
+        tick(reconciler).await;
+    }
+    let current = counts(pool, campaign).await?;
+    if current.done > 0 {
+        return Ok(());
+    }
+    let phase = campaign_phase(pool, campaign).await?;
+    Err(format!(
+        "campaign {campaign} didn't complete its canary within {limit} ticks (phase={phase}, counts={current:?})"
+    )
+    .into())
 }

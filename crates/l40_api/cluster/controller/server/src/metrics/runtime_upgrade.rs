@@ -1,10 +1,10 @@
 //! Runtime upgrade campaigns, driven by the `runtime_upgrade` reconciler.
 //!
 //! * `runtime_upgrade.campaigns` (gauge): unfinished campaigns, every tick of
-//!   the `runtime_upgrade` reconciler. Tags: `kind` (`templates` or
-//!   `sandboxes`) and `phase` (`canary`, `rolling` or `paused`); every
-//!   combination is emitted, zero included, so a campaign that changes phase
-//!   leaves no stale series.
+//!   the `runtime_upgrade` reconciler. Tags: `kind` (`templates`, `sandboxes`,
+//!   or `sandbox_force_restarts`) and `phase` (`canary`, `rolling` or
+//!   `paused`); every combination is emitted, zero included, so a campaign that
+//!   changes phase leaves no stale series.
 //! * `runtime_upgrade.campaign.items` (gauge): one campaign's items by phase,
 //!   every tick. Tags: `campaign_id`, `kind`, and `phase` (`pending`,
 //!   `in_flight`, `done`, `failed` or `skipped`), zero included.
@@ -17,8 +17,9 @@
 //!   finishes.
 //! * `runtime_upgrade.campaign.item_outcome` (counter): one per leased item
 //!   the reconciler finished. Tags: `kind` and `outcome` (`done`, `skipped`,
-//!   `failed`, `retry`, `released` when the subject was mid-transition and
-//!   the lease didn't count as an attempt, or `lease_lost` when the worker
+//!   `failed`, `retry`, `released` when the item returned to pending without
+//!   spending an attempt — a mid-transition subject or a driver-stopped sandbox
+//!   waiting out a temporary policy hold — or `lease_lost` when the worker
 //!   no longer held the lease, before the upgrade started or before its
 //!   outcome was recorded: it lapsed, another holder took it, or its campaign
 //!   was aborted). An item whose outcome write failed isn't counted.
@@ -41,7 +42,8 @@ metric_vocabulary!(
         Failed => "failed",
         Retry => "retry",
         /// Returned to pending without spending an attempt: the subject was
-        /// mid-transition.
+        /// mid-transition, or a driver-stopped sandbox waited out a temporary
+        /// policy hold.
         Released => "released",
         /// The worker no longer held the lease, before the upgrade started or
         /// before its outcome was recorded: it lapsed, another holder took

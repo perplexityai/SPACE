@@ -48,7 +48,7 @@ async fn a_campaign_is_held_while_the_policy_doesnt_call_for_its_move() -> TestR
             .into_iter()
             .find(|listed| listed.id == campaign)
             .expect("the campaign is unfinished");
-        let driver = SandboxDriver::new(db.pool.clone(), K8S.as_str(), FakeDispatcher::default());
+        let driver = SandboxDriver::new(db.pool.clone(), K8S, FakeDispatcher::default());
         assert_eq!(driver.plan(&listed).await?, Plan::Hold(reason));
     }
     Ok(())
@@ -434,7 +434,7 @@ async fn a_page_isnt_judged_under_inputs_that_changed_since_the_plan() -> TestRe
     .await?;
     let node = node(&db.pool).await?;
     stopped_on_source(&db.pool, node).await?;
-    let driver = SandboxDriver::new(db.pool.clone(), K8S.as_str(), FakeDispatcher::default());
+    let driver = SandboxDriver::new(db.pool.clone(), K8S, FakeDispatcher::default());
     let campaign = store::list_unfinished(&db.pool)
         .await?
         .into_iter()
@@ -444,7 +444,9 @@ async fn a_page_isnt_judged_under_inputs_that_changed_since_the_plan() -> TestRe
         panic!("a blocked source with an edge scans");
     };
     assert!(plan.moves);
-    let page = driver.find_subjects(&campaign, plan, None, 10).await?;
+    let SubjectScan::Page(page) = driver.find_subjects(&campaign, plan, None, 10).await? else {
+        panic!("the plan matches");
+    };
     assert_eq!(page.on_source.len(), 1);
 
     // Deprecated, the source's running sandboxes no longer count, so a page
@@ -460,7 +462,7 @@ async fn a_page_isnt_judged_under_inputs_that_changed_since_the_plan() -> TestRe
     tx.commit().await?;
     assert_eq!(
         driver.find_subjects(&campaign, plan, None, 10).await,
-        Err(PLAN_CHANGED.to_owned())
+        Ok(SubjectScan::PlanChanged)
     );
     let Plan::Scan(replanned) = driver.plan(&campaign).await? else {
         panic!("a deprecated source with an edge scans");
@@ -487,7 +489,7 @@ async fn only_the_sources_edges_and_every_rows_identity_enter_the_plan() -> Test
     };
     seed_policy(&db.pool, RuntimeEnvironmentState::Deprecated, true).await?;
     let campaign = insert_campaign(&db.pool, seed()).await?;
-    let driver = SandboxDriver::new(db.pool.clone(), K8S.as_str(), FakeDispatcher::default());
+    let driver = SandboxDriver::new(db.pool.clone(), K8S, FakeDispatcher::default());
     let campaign = store::list_unfinished(&db.pool)
         .await?
         .into_iter()
