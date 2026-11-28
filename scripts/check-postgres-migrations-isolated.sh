@@ -413,7 +413,7 @@ is_postgres_bootstrap_test_append() {
     else
       tail -c "+$((base_size + 1))" "${file}" >"${check_dir}/appended.rs"
       if grep -Eq \
-        -e '^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?(const|static|type|mod|struct|enum|trait|union|fn)[[:space:]]+(CREDENTIAL_TABLES|RO_COLUMN_DENYLIST)([^[:alnum:]_]|$)' \
+        -e '^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?(const|static|type|mod|struct|enum|trait|union|fn)[[:space:]]+(CREDENTIAL_TABLES|RETIRED_CREDENTIAL_TABLES|RO_COLUMN_DENYLIST)([^[:alnum:]_]|$)' \
         -e '^[[:space:]]*use[[:space:]].*(CREDENTIAL_TABLES|RO_COLUMN_DENYLIST)([^[:alnum:]_]|$)' \
         "${check_dir}/appended.rs"; then
         echo "ERROR: appended bootstrap-role tests may not shadow or replace fence constants." >&2

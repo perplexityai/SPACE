@@ -138,40 +138,19 @@ impl From<pplx_space_byok_store::MasterKeyRecord> for OrgMasterKey {
     }
 }
 
-/// Per-sandbox encryption sidecar. Presence-of-row IS the encryption
-/// invariant; one `wrapped_dek` encrypts all encrypted columns on
-/// the row. Cross-tenant binding is impossible structurally — two
-/// composite FKs on `(sandbox_id, org_id)` and
-/// `(master_key_id, org_id)` enforce `sandbox.org_id = master_key.org_id`.
-///
-/// Encrypted columns mirror their `sandboxes` counterparts (BYTEA
-/// here vs JSONB on the parent). Nullability matches the parent:
-/// `env` and `metadata` are NOT NULL; `network_policy_override_json`
-/// is nullable.
+/// Per-template encryption sidecar. Keyed on `templates.name`
+/// (templates have no UUID PK). Presence-of-row IS the encryption
+/// invariant; one `wrapped_dek` encrypts both encrypted columns,
+/// `description` (BYTEA, nullable like its parent) and
+/// `network_policy_json` (BYTEA, NOT NULL like its parent).
+/// Cross-tenant binding is impossible structurally — two composite FKs
+/// on `(template_name, org_id)` and `(master_key_id, org_id)` enforce
+/// `template.org_id = master_key.org_id`.
 ///
 /// **Stand-in convention** (application contract, not schema-
 /// enforced): when this row exists, the parent's plaintext columns
-/// MUST hold their default (`'{}'` / NULL), not the real value. The
-/// sidecar is the source of truth.
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-pub struct SandboxEncryptedFields {
-    pub id: Uuid,
-    pub sandbox_id: SandboxId,
-    pub org_id: OrgId,
-    pub master_key_id: Uuid,
-    pub wrapped_dek: Vec<u8>,
-    pub env: Vec<u8>,
-    pub metadata: Vec<u8>,
-    pub network_policy_override_json: Option<Vec<u8>>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
-}
-
-/// Per-template encryption sidecar. Keyed on `templates.name`
-/// (templates have no UUID PK). Same shape and invariants as
-/// [`SandboxEncryptedFields`]; one DEK encrypts `description` (BYTEA,
-/// nullable like its parent) and `network_policy_json` (BYTEA, NOT
-/// NULL like its parent).
+/// MUST hold their default, not the real value. The sidecar is the
+/// source of truth.
 ///
 /// **System templates** (`templates.org_id IS NULL`) cannot have a
 /// sidecar — intentional, shared-infra templates have no org KEK.
@@ -189,7 +168,7 @@ pub struct TemplateEncryptedFields {
 }
 
 /// Per-storage-location encryption sidecar for a snapshot replica.
-/// Same shape and invariants as [`SandboxEncryptedFields`]. One row
+/// Same shape and invariants as [`TemplateEncryptedFields`]. One row
 /// per storage location (per-replica DEK). The encrypted column
 /// `storage_connection_string` is BYTEA NOT NULL, mirroring the
 /// parent's `text NOT NULL`; stand-in convention applies.

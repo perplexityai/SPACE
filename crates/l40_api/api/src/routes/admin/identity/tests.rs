@@ -341,28 +341,6 @@ async fn delete_user_answers_conflict_while_the_user_owns_sandboxes()
         .bind(sandbox_id)
         .execute(&db.pool)
         .await?;
-    sqlx::query(sql!(
-        "INSERT INTO sandbox_archives (
-             sandbox_id, org_id, user_id, sandbox_created_at, manifest_id,
-             manifest_sha256, stored_bytes
-         ) VALUES ($1, $2, $3, NOW(), $4, '\\x00', 0)"
-    ))
-    .bind(sandbox_id)
-    .bind(actor.org_id)
-    .bind(user_id)
-    .bind(Uuid::now_v7())
-    .execute(&db.pool)
-    .await?;
-    let error = delete()
-        .await
-        .expect_err("an archived sandbox must block the delete");
-    assert_eq!(error.status(), StatusCode::CONFLICT);
-    assert_eq!(error.reason(), Some("user_owns_archived_sandboxes"));
-
-    sqlx::query(sql!("DELETE FROM sandbox_archives WHERE sandbox_id = $1"))
-        .bind(sandbox_id)
-        .execute(&db.pool)
-        .await?;
 
     // A deleted sandbox's row is kept for retention and still holds the user.
     let tombstone =
@@ -495,24 +473,6 @@ async fn delete_org_answers_conflict_naming_what_still_references_it()
     .await?;
     refused_with("org_has_sandboxes").await?;
     sqlx::query(sql!("DELETE FROM sandboxes WHERE id = $1"))
-        .bind(sandbox_id)
-        .execute(&db.pool)
-        .await?;
-
-    sqlx::query(sql!(
-        "INSERT INTO sandbox_archives (
-             sandbox_id, org_id, user_id, sandbox_created_at, manifest_id,
-             manifest_sha256, stored_bytes
-         ) VALUES ($1, $2, $3, NOW(), $4, '\\x00', 0)"
-    ))
-    .bind(sandbox_id)
-    .bind(org_id)
-    .bind(actor.id)
-    .bind(Uuid::now_v7())
-    .execute(&db.pool)
-    .await?;
-    refused_with("org_has_archived_sandboxes").await?;
-    sqlx::query(sql!("DELETE FROM sandbox_archives WHERE sandbox_id = $1"))
         .bind(sandbox_id)
         .execute(&db.pool)
         .await?;
@@ -688,7 +648,7 @@ async fn insert_orphaned_encrypted_location(
 /// the delete of the master key an organization's delete cascades to, which
 /// the database reports only if it checks them before the sandbox or template
 /// row itself. Each is classified from the database's own error, one for each
-/// of the five constraints that restrict a master key's delete.
+/// constraint the classifier maps that restricts a master key's delete.
 #[tokio::test(flavor = "current_thread")]
 async fn org_delete_blockers_classify_the_database_constraint() -> pplx_space_test_env::TestResult {
     let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
@@ -718,28 +678,6 @@ async fn org_delete_blockers_classify_the_database_constraint() -> pplx_space_te
     .execute(&db.pool)
     .await?;
     let delete_master_key = sql!("DELETE FROM org_master_keys WHERE id = $1");
-
-    let mut tx = db.pool.begin().await?;
-    sqlx::query(sql!(
-        "INSERT INTO sandbox_encrypted_fields (
-             sandbox_id, org_id, master_key_id, wrapped_dek, env, metadata
-         ) VALUES ($1, $2, $3, '\\x00', '\\x00', '\\x00')"
-    ))
-    .bind(sandbox_id)
-    .bind(org_id)
-    .bind(master_key_id)
-    .execute(tx.as_mut())
-    .await?;
-    let error = sqlx::query(delete_master_key)
-        .bind(master_key_id)
-        .execute(tx.as_mut())
-        .await
-        .expect_err("encrypted fields restrict their master key's delete");
-    assert_eq!(
-        OrgDeleteBlocker::from_delete_error(&DbError::from(error)),
-        Some(OrgDeleteBlocker::Sandboxes)
-    );
-    tx.rollback().await?;
 
     let mut tx = db.pool.begin().await?;
     sqlx::query(sql!(
