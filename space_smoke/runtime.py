@@ -784,6 +784,17 @@ def _sigterm_raises() -> Iterator[None]:
         signal.signal(signal.SIGTERM, previous_handler)
 
 
+def cleanup_reserve_seconds(
+    timeout_seconds: float | None, cleanup_timeout_seconds: float | None
+) -> float | None:
+    """The part of a scenario's timeout kept for its cleanup: the scenario's
+    own reserve, else `min(120 s, 10 %)` of the timeout."""
+
+    if cleanup_timeout_seconds is not None:
+        return cleanup_timeout_seconds
+    return min(120.0, timeout_seconds * 0.1) if timeout_seconds is not None else None
+
+
 def execute_scenario(
     *,
     title: str,
@@ -798,9 +809,7 @@ def execute_scenario(
         or (timeout_seconds is not None and cleanup_timeout_seconds >= timeout_seconds)
     ):
         raise ValueError("cleanup reserve must be positive and smaller than the scenario timeout")
-    cleanup_timeout = cleanup_timeout_seconds if cleanup_timeout_seconds is not None else (
-        min(120.0, timeout_seconds * 0.1) if timeout_seconds is not None else None
-    )
+    cleanup_timeout = cleanup_reserve_seconds(timeout_seconds, cleanup_timeout_seconds)
     execution_timeout = (
         timeout_seconds - cleanup_timeout
         if timeout_seconds is not None and cleanup_timeout is not None

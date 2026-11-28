@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shlex
+import subprocess
 import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
 from space_smoke.registry import SUBSTRATES, TIERS, Scenario
-from space_smoke.runtime import SmokeConfigurationError, execute_scenario
+from space_smoke.runtime import SmokeConfigurationError, _sigterm_raises, execute_scenario
 from space_smoke.scenarios import REGISTRY
 from space_smoke.services import (
     SUITE_BOOTSTRAPPED_ENV,
+    SUITE_ECW_API_KEY_ENV,
     MissingToolError,
     SmokeServices,
     repair_orphaned_kind_faults,
@@ -597,6 +600,7 @@ def _run_all(
         # caller's environment says; its scenarios rely on that.
         suite_environment = dict(os.environ)
         suite_environment.pop(SUITE_BOOTSTRAPPED_ENV, None)
+        suite_environment.pop(SUITE_ECW_API_KEY_ENV, None)
         services = SmokeServices.from_environment(
             scenarios[0], suite_environment, required_tools=required_tools
         )
@@ -647,6 +651,8 @@ def _run_all(
         )
 
     environment = dict(os.environ)
+    # Only this suite's own bootstrap may vouch for its scenarios.
+    environment.pop(SUITE_BOOTSTRAPPED_ENV, None)
     if environment.get("SPACE_SMOKE_BACKEND", "kind") == "kind":
         environment["SKIP_BOOTSTRAP"] = "1"
         # The scenarios skip the checks this bootstrap ran only if it ran the
@@ -659,15 +665,54 @@ def _run_all(
                 "NOTE: the image provenance check did not run (Tilt was still updating); "
                 "each scenario runs the full bootstrap"
             )
-    label = f" {category}" if category is not None else ""
-    print(f"Running {len(scenarios)}{label} smoke scenarios sequentially.")
-    results = run_scenarios(
-        scenarios,
-        environment=environment,
-        on_start=_print_started,
-        line_sink=_print_line,
-        on_result=_print_finished,
+    environment.pop(SUITE_ECW_API_KEY_ENV, None)
+    # One run-owned ECW credential for every scenario, seeded once here and
+    # deleted once they end, where each scenario would seed and delete its own.
+    # It is deleted only once no scenario process is running: one still
+    # cleaning up after an interrupt deletes its sandboxes with it.
+    suite_key = (
+        services.api_key
+        if environment.get("SPACE_SMOKE_BACKEND", "kind") == "kind"
+        and services.kind is not None
+        and services.owns_api_key
+        else None
     )
+    processes: list[subprocess.Popen[str]] = []
+    # From the seed on, SIGTERM unwinds into the `finally` too; a second
+    # interrupt, which ends the wait for a running scenario, still unwinds.
+    with _sigterm_raises():
+        try:
+            if suite_key is not None:
+                try:
+                    services.kind.seed_api_key(suite_key)
+                except Exception as error:  # noqa: BLE001 - suite setup boundary
+                    # The `finally` deletes it: the insert may have committed
+                    # without kubectl seeing it.
+                    print(f"ERROR: seed the suite's ECW credential: {type(error).__name__}: {error}", file=sys.stderr)
+                    return 2
+                environment[SUITE_ECW_API_KEY_ENV] = suite_key
+            label = f" {category}" if category is not None else ""
+            print(f"Running {len(scenarios)}{label} smoke scenarios sequentially.")
+            results = run_scenarios(
+                scenarios,
+                environment=environment,
+                on_start=_print_started,
+                line_sink=_print_line,
+                on_result=_print_finished,
+                processes=processes,
+            )
+        finally:
+            if suite_key is not None:
+                if any(process.poll() is None for process in processes):
+                    # Its reader may have gone with the interrupt.
+                    with contextlib.suppress(OSError):
+                        print(
+                            "NOTE: the suite's ECW credential was left for a scenario still running",
+                            flush=True,
+                        )
+                    raise SystemExit(2)
+                if not _delete_suite_key(services, suite_key):
+                    telemetry_error = telemetry_error or "the suite's ECW credential was not deleted"
     _write_failure_details(results)
 
     passed = sum(result.exit_code == 0 for result in results)
@@ -699,6 +744,18 @@ def _run_all(
         if exit_code in (0, 42):
             exit_code = 2
     return exit_code
+
+
+def _delete_suite_key(services: SmokeServices, api_key: str) -> bool:
+    """Delete the suite's ECW credential; whether that succeeded, a failure printed."""
+
+    assert services.kind is not None
+    try:
+        services.kind.delete_api_key(api_key)
+    except Exception as error:  # noqa: BLE001 - reported, then the suite's status decides
+        print(f"ERROR: delete the suite's ECW credential: {type(error).__name__}: {error}", file=sys.stderr)
+        return False
+    return True
 
 
 def _mode_emptied(

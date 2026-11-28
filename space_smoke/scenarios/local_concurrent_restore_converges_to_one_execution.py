@@ -15,11 +15,12 @@ CALLERS = 20
 # The compose hammer proved claim-before-create in the restore path under real
 # multi-process contention, against a stub apiserver whose knobs opened the
 # windows: a pod-POST delay, a forced first-POST failure, and a POST counter.
-# This is its real-cluster form. Three API replicas serve twenty gated
-# `connect` callers; the counters are the API's own `sandbox_k8s_executions`
-# rows and the sandbox's pods by label; the windows are a namespace pod-count
-# quota (pod POSTs are refused at admission until it is lifted — the stub
-# failed exactly one, so the verdict counts refusals instead of assuming one)
+# This is its real-cluster form. The API's replicas, two at least and held
+# at their standing count, serve twenty gated `connect` callers; the counters
+# are the API's own `sandbox_k8s_executions` rows and the sandbox's pods by
+# label; the windows are a namespace pod-count quota (pod POSTs are refused at
+# admission until it is lifted — the stub failed exactly one, so the verdict
+# counts refusals instead of assuming one)
 # and, for the teardown fence, the same quota keeping the callers' claims
 # refused — waiting callers re-claim as each refused claim is retired — so the
 # delete aims at that window, landing on a `suspended` sandbox if every caller
@@ -35,14 +36,14 @@ CALLERS = 20
 # returned.
 @smoke.scenario(
     "local.concurrent_restore_converges_to_one_execution",
-    # Four restore windows, an API scale-up rollout, and a pod deletion with
-    # its grace period; each restore itself is seconds on kind.
+    # Four restore windows and a pod deletion with its grace period; each
+    # restore itself is seconds on kind.
     sandbox=smoke.SandboxConfig(timeout=1800),
 )
 def concurrent_restore_converges_to_one_execution(test: smoke.KindEcw) -> None:
-    """Twenty concurrent connects to a suspended sandbox, spread over three API
-    replicas, produce exactly one execution and one pod with every caller
-    landing on it; a started sandbox whose pod is deleted recovers under the
+    """Twenty concurrent connects to a suspended sandbox, spread over two or
+    more API replicas, produce exactly one execution and one pod with every
+    caller landing on it; a started sandbox whose pod is deleted recovers under the
     same contention onto one new generation restored from its suspend
     checkpoint; pod POSTs refused at admission retire their generations and
     the callers converge on the one that was admitted, the refused callers
@@ -53,10 +54,10 @@ def concurrent_restore_converges_to_one_execution(test: smoke.KindEcw) -> None:
     race = test.concurrent_restore
     restore = test.cross_node_restore  # portability wait only
 
-    with test.phase("write state and run the public API at three replicas"):
+    with test.phase("write state and hold the public API at two or more replicas"):
         written = test.run_command_when_ready(f"printf %s {shlex.quote(marker)} > {shlex.quote(PATH)}")
         test.verify(written.exit_code == 0, "failed to write state", command_stderr=written.stderr)
-        race.scale_api_for_contention(3)
+        race.pin_api_for_contention()
 
     with test.phase("happy: suspend, then twenty concurrent connects"):
         test.pause()
@@ -192,5 +193,5 @@ def concurrent_restore_converges_to_one_execution(test: smoke.KindEcw) -> None:
             delete_returned_at=delete_returned_at,
         )
 
-    with test.phase("scale the public API back"):
+    with test.phase("release the public API's replica count"):
         race.restore_api_scale()

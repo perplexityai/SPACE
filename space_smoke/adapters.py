@@ -1781,9 +1781,18 @@ class KindHarness:
         """Bootstrap the stack; whether its image provenance check ran and passed.
 
         A `SKIP_BOOTSTRAP=1` bootstrap skips that check while Tilt is still
-        updating, and the per-scenario recheck never runs it.
+        updating. A scenario the suite runner launched after its own
+        bootstrap passed that check repeats none of it, as Native scenarios
+        never have: what it checks changes only by provisioning the box,
+        recreating the cluster, a Tilt build or another bring-up, none of
+        which a scenario does. The cluster's own port mapping holds the API
+        port for as long as the cluster runs. Kind's v1 drain scenarios set
+        the `drain-keep` override, so their drains stop at `drained` and write
+        no tombstone; the v2 drain scenarios assert that they write none.
         """
 
+        if self.config.skip_bootstrap and self.config.suite_bootstrapped:
+            return True
         script = REPO_ROOT / "scripts/tests/lib/bootstrap-kind-stack.sh"
         environment = dict(self.environment)
         environment.update(
@@ -1797,9 +1806,6 @@ class KindHarness:
             }
         )
         entry = "bootstrap_kind_stack"
-        if self.config.skip_bootstrap and self.config.suite_bootstrapped:
-            # The library's own split of what can change between scenarios.
-            entry = "kind_stack_recheck_for_scenario"
         with tempfile.TemporaryDirectory(prefix="space-smoke-bootstrap-") as scratch:
             passed = Path(scratch) / "provenance-passed"
             environment["KIND_STACK_PROVENANCE_PASSED_FILE"] = str(passed)
@@ -3727,15 +3733,22 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
         return names[0]
 
+    def public_api_replicas(self) -> int:
+        return self._public_api_replicas(self._public_api_deployment())
+
+    def _public_api_replicas(self, name: str) -> int:
+        replicas = _require_ok(
+            self.kubectl("get", "deploy", name, "-o", "jsonpath={.spec.replicas}", timeout=15),
+            f"read replicas of {name}",
+        ).strip()
+        return int(replicas) if replicas.isdigit() else 1
+
     def scale_public_api(self, replicas: int) -> int:
         self._require_isolated_kind("public API scaling")
         if replicas < 1 or replicas > 5:
             raise ValueError(f"refusing to scale the public API to {replicas} replicas")
         name = self._public_api_deployment()
-        previous = _require_ok(
-            self.kubectl("get", "deploy", name, "-o", "jsonpath={.spec.replicas}", timeout=15),
-            f"read replicas of {name}",
-        ).strip()
+        previous = self._public_api_replicas(name)
         autoscaler = self._public_api_autoscaler(name)
         if autoscaler is not None:
             # An autoscaler owns the replica count and reconciles a manual
@@ -3753,7 +3766,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             self.kubectl("scale", f"deploy/{name}", f"--replicas={replicas}", timeout=30),
             f"scale {name} to {replicas}",
         )
-        return int(previous) if previous.isdigit() else 1
+        return previous
 
     def restore_public_api_autoscaler(self) -> None:
         if self._public_api_autoscaler_bounds is None:

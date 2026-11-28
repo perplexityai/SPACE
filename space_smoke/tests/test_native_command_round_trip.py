@@ -550,6 +550,9 @@ class NativeCommandRoundTripTests(unittest.TestCase):
                         "seed",
                         ready_timeout_seconds=3,
                         request_timeout_seconds=3,
+                        # The attempt counts below are this poll within
+                        # the 3 s deadline.
+                        poll_interval_seconds=1,
                     )
                 )
                 sandbox = native_module._NativeSandbox(factory, _SANDBOX_ID)
