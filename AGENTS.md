@@ -55,6 +55,20 @@ the same release do not count. If that cannot be verified, stop and request
 maintainer confirmation before recommending merge. Stage new customer-affecting
 automation behind a default-off switch unless a maintainer approves otherwise.
 
+## Boundary review
+
+Treat protobuf/RPC, persisted-state, and migration changes as expensive to
+reverse, including semantic changes without schema edits. Before requesting
+review, explain the invariant, why the boundary must change, one concrete
+before/after example, and the rollout and recovery plan. Distinguish binary
+rollback from schema/data reversal and state which guarantees hold at each
+independently deployable step.
+
+Reviewers must raise specific unanswered safety questions, not request
+redundant prose. Passing CI or AI review does not replace a boundary-owning
+human's understanding of the change. Resolve uncertainty through clarification
+or a walkthrough before recommending merge.
+
 ## Public-safe reproductions
 
 Treat this repository as upstream when investigating a problem from a private
